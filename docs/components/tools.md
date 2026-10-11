@@ -39,6 +39,23 @@ tests before implementation details and benchmark results:
 - {repo}`Peer-memory rules and tests <tools/docs/numsim/MULTI_GPU_PEER.md>`
 - {repo}`Draft validation status and remaining gates <tools/docs/numsim/MULTI_GPU_VALIDATION.md>`
 
+The complete `MulticastWindow` and `SymmetricBuffer` input constructions are
+in the {doc}`multi-GPU input examples <api/inputs>`. In both cases, construct
+the per-rank list once and reuse it for all three CPU preflights:
+
+```python
+from tirx_harness import numsim, racecheck, synccheck
+
+module = numsim.transpile(kernel)
+sim = numsim.Engine().run(module, inputs, outputs=("out",))
+racecheck(kernel, inputs).require_clean()
+synccheck(kernel, inputs).require_clean()
+```
+
+`sim.outputs[numsim.rank_binding_name("out", rank)]` retrieves a rank's
+modeled result. These calls do not launch a GPU; launch the actual kernel only
+after the CPU checks pass, then compare its outputs with `sim`.
+
 ## NumSim
 
 **When to use it.** Use NumSim when getting a real GPU run is costly or
@@ -126,6 +143,22 @@ diagnostics alongside the workload's numerical comparison result.
 
 See the {repo}`NumSim API source <tools/src/tirx_harness/numsim/api.py>`
 for full signatures.
+
+**Benchmark handoff.** The benchmark launchers use the same world-size and
+rank-local binding pattern on real GPUs. Run the CPU preflight first, then use
+the benchmark entry point for the device comparison:
+
+```bash
+python -m benchmarks.multimem.two_shot_all_reduce --world 4
+python -m benchmarks.multimem.gemm_all_reduce compare --shapes cutlass_default
+python -m benchmarks.peer.all_gather_gemm compare --shapes cutlass_default
+```
+
+The multimem launcher constructs one symmetric workspace per rank in
+{repo}`two_shot_all_reduce.py <tools/benchmarks/multimem/two_shot_all_reduce.py>`;
+the peer launcher follows the same pattern in
+{repo}`all_gather_gemm.py <tools/benchmarks/peer/all_gather_gemm.py>`. Generated
+benchmark JSON/JSONL output is local run data and is not committed.
 
 **Limitations.**
 
