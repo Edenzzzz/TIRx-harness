@@ -10,10 +10,25 @@ from the work needed to close the correctness and performance goal.
 
 The October 10, 2026 handoff preserves the prior GB200 result files and ports
 on upstream `66681fb`, including the `tirx_harness/` to `tools/` directory
-rename. The old GPU job is no longer running. Native and GPU validation of
-this integrated branch is pending a replacement Linux/4× GB200 environment.
-The local machine has no Cargo or installed harness environment; its attempted
-Python test run stopped during collection, not at a kernel test failure.
+rename. Subsequent validation of runtime sources at `deda386` built the native
+frontend and passed **499 CPU tests in 146.23 seconds**, using four pytest
+workers with work stealing. This covered the three multimem/peer runtime
+files and all ten new Racecheck/Synccheck test files listed in the feature
+guides. Later commits through `0d2f86e` only change documentation.
+
+That run used Rust 1.99 and Python 3.11, with the native extension staged
+manually after the wheel rejected Python 3.11. It demonstrates those CPU
+checks executing, but does not pass the installation gate: the package
+requires Python 3.12 or 3.13, and the native tests must also be repeated in a
+supported installed environment. The full Rust and parent-package suites
+remain pending.
+
+The live GPU suite has not passed. Its first attempt lacked `cuda.bindings`;
+after that dependency was installed, the retry reported failures before the
+SSH connection was lost. The final diagnostics were not captured, so no
+kernel or hardware cause is established. No new performance-equivalence
+measurements completed. Continue the GPU checks under the shared socket lease
+when an active worker is available; preserve the same kernel implementation.
 
 Local handoff checks passed for all 52 changed Python files' syntax, one JSON
 result file and 11,950 JSONL records, 37 local documentation links, 32 named
