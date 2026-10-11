@@ -8,9 +8,10 @@ from the work needed to close the correctness and performance goal.
 
 ## Current evidence
 
-The October 10, 2026 handoff preserves the prior GB200 result files and ports
-on upstream `66681fb`, including the `tirx_harness/` to `tools/` directory
-rename. Subsequent validation of runtime sources at `deda386` built the native
+The October 10, 2026 handoff preserves the prior GB200 measurement tables and
+ports on upstream `66681fb`, including the `tirx_harness/` to `tools/` directory
+rename. Raw benchmark JSON/JSONL artifacts are intentionally not committed.
+Subsequent validation of runtime sources at `deda386` built the native
 frontend and passed **499 CPU tests in 146.23 seconds**, using four pytest
 workers with work stealing. This covered the three multimem/peer runtime
 files and all ten new Racecheck/Synccheck test files listed in the feature
@@ -76,11 +77,10 @@ documented dtypes and world size 4, not every possible kernel shape or device.
 
 The complete per-shape latency tables and measurement details are in the
 [multimem results](MULTI_GPU_MULTIMEM.md#results) and
-[peer results](MULTI_GPU_PEER.md#results). Raw data lives in
-[`benchmarks/multimem/results`](../../benchmarks/multimem/results/) and
-[`benchmarks/peer/results`](../../benchmarks/peer/results/). Recomputing these
-ratios is an audit of recorded data, not new GPU correctness or timing evidence.
-Result files do not replace fresh validation of the final commit.
+[peer results](MULTI_GPU_PEER.md#results). The raw benchmark JSON/JSONL files
+are intentionally omitted from this branch. Recomputing these ratios from a
+local run is an audit of recorded data, not new GPU correctness or timing
+evidence. Recorded tables do not replace fresh validation of the final commit.
 
 The previous session reported 245 peer tests, 348 multimem tests including
 GPU microtests, 885 engine tests, and 15 frontend tests passing. These counts

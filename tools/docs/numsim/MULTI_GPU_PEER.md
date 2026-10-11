@@ -583,10 +583,9 @@ A ratio is TIRx's latency over the origin's, so the bar is a ratio of at most
 
 Every shape meets the bar in both runs; the worst ratio is 1.004. On every
 shape, the output and the cumulative expert statistics equal DeepGEMM's bit
-for bit. Both runs are of the same source (digest `31284daeef41759a`):
-`results/mega_moe_gb200x4.jsonl` and the repeat,
-`results/mega_moe_gb200x4_repeat.jsonl`. The times are run 1's; the repeat's
-are in its file.
+for bit. Both runs are of the same source (digest `31284daeef41759a`). The
+table is transcribed from an external run; the commands above regenerate the
+JSONL outputs locally when a worker is available.
 
 | Shape | Tokens per rank | Hidden, I | Experts, top-k, shared | DeepGEMM (us) | TIRx (us) | Ratio | Repeat ratio |
 |---|---:|---|---|---:|---:|---:|---:|
@@ -610,12 +609,10 @@ are in its file.
 Every shape meets the bar in both runs. The worst ratio is 1.007
 (`llama70b_gate_up_m2048` in run 1; 0.986 in the repeat). In each run, all
 219 compared configurations (CUTLASS 136, TIRx 51, cake 16, cuTile 16) left
-the exact result on every rank. The files are
-`results/all_gather_gemm_gb200x4.jsonl` and the repeat,
-`results/all_gather_gemm_gb200x4_repeat.jsonl`, from the tuning log
-`results/all_gather_gemm_tuning.jsonl`. Each column is that implementation's
-best compared configuration, and the faster origin is in bold. The times are
-run 1's.
+the exact result on every rank. The table is transcribed from an external run;
+the commands above regenerate the tuning and comparison JSONL outputs locally.
+Each column is that implementation's best compared configuration, and the
+faster origin is in bold. The times are run 1's.
 
 | Shape | M per rank, N, K | Types | CUTLASS (us) | cake (us) | cuTile (us) | TIRx (us) | Ratio | Repeat ratio |
 |---|---|---|---:|---:|---:|---:|---:|---:|
@@ -646,8 +643,8 @@ run 1's.
 - **CUTLASS's configurations:** its own `can_implement` rejected 16, and one,
   `cutlass_default` with a 2-CTA 128x128 tile, a 2x2 cluster and the direct
   store, left a wrong result on another rank in the tune. It is not compared.
-- **TIRx's configurations:** 1682 tuned, all correct. The table's TIRx
-  configurations are in the result files.
+- **TIRx's configurations:** 1682 tuned, all correct. Rerun `tune` and
+  `compare` to regenerate the local configuration records.
 
 ## Running
 

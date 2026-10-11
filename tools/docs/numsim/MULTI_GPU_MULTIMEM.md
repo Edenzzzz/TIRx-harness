@@ -664,7 +664,9 @@ its origin's bit for bit.
 
 Measured on 4× GB200 (sm_100a, driver 580.126.20) with torch 2.14.1+cu130,
 NCCL 2.30.7, nvidia-cutlass-dsl 4.7.0, CUTLASS `0b55a2f691d6` and FlashInfer
-`776939f82869`. The raw rows are in `benchmarks/multimem/results/`.
+`776939f82869`. The raw benchmark JSON/JSONL artifacts are intentionally not
+committed; the commands above regenerate them locally under
+`benchmarks/multimem/results/`.
 
 **Two-shot all-reduce** against CUTLASS, f32, world size 4. The first two rows
 are CUTLASS's shapes; the rest are the sweep.
@@ -692,8 +694,9 @@ are CUTLASS's shapes; the rest are the sweep.
 
 **GEMM + all-reduce**, world size 4. Each row compares the origin's best time
 over its 3 fastest configurations against TIRx's best over the same
-configurations. The times are from `gemm_all_reduce_gb200x4.jsonl`. "Repeat
-run" is the ratio from the independent repeat (`..._repeat.jsonl`).
+configurations. The table is transcribed from an external run. "Repeat run" is
+the ratio from that run's independent repeat; rerunning the commands above
+regenerates the JSONL outputs locally.
 Configurations read as MMA (1- or 2-CTA) and tile, cluster, then CUTLASS's
 raster and swizzle; "st" marks FlashInfer's direct-store epilogue.
 
@@ -758,7 +761,7 @@ Notes on reading these numbers:
     origin and TIRx alternate on the same tile, so each follows the other. A
     rerun of the four heaviest or closest shapes with the device idle 0.5 s
     before every sample (`compare --idle-s 0.5`,
-    `gemm_all_reduce_gb200x4_idle.jsonl`) measured, against CUTLASS and
+    idle output) measured, against CUTLASS and
     FlashInfer: `cutlass_doc` 0.988 and 1.001, `llama70b_down_m8192` 0.995
     and 0.995, `llama70b_o_m8192` 0.996 and 0.999, `llama8b_o_m2048` 1.005
     and 0.995. All were correct and bitwise equal. A first such rerun had
