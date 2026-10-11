@@ -57,7 +57,7 @@ are historical reports; they have not been reproduced on this branch.
   variant against the origins across the complete shape matrix.
 - **Mega MoE is `review`, not `clean`.** Its test requires zero physical race
   findings and one `alias_stale_read` advisory. The
-  [provenance explanation](MULTI_GPU_PEER.md#litmus-kernels-and-tests) describes
+  [provenance explanation](MULTI_GPU_PEER.md#shared-pool-alias-advisory) describes
   the unnamed bulk-copy write that leaves an old shared-pool name visible to
   the alias tracker. Resolve or explicitly adjudicate the advisory; do not
   silently drop it or reinterpret `review` as a clean result.

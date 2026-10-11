@@ -16,44 +16,18 @@ ISA's "Memory Consistency Model" chapter.
 
 ## Supported operations
 
-The layer checks peer addresses through the ordinary global-memory path for:
+Every supported global-memory instruction can address a mapped peer replica.
+The tested forms are:
 
-- weak, relaxed, acquire, and release loads/stores and vector accesses;
-- 32- and 64-bit atomics, reductions, CAS polling, and system-scope waits;
-- bulk and Tensor Memory Accelerator copies through peer symmetric memory;
-- reachability of raw peer addresses and tensor maps.
-
-The operation details, ordering rules, counterexamples, and related tests are
-listed immediately below. Invalid peer access to private memory is an error;
-an address alone does not establish visibility or synchronization.
+| Kind | Forms exercised by the tests |
+|---|---|
+| Loads and stores | `ld`/`st` weak, `.relaxed`, `.acquire`/`.release` at `.gpu`/`.sys`, `.v4` vectors |
+| Atomics | `atom.add`, `atom.cas` (`.relaxed`/`.acquire`, `.gpu`/`.sys`), `red.add` (`.relaxed`/`.release`), 32- and 64-bit |
+| Bulk copies | `cp.async.bulk` global to shared (`mbarrier::complete_tx`) and shared to global (`bulk_group`) |
+| TMA | `cp.async.bulk.tensor` loads and stores through a `TensorMap` over a peer's replica |
+| Polls | `T.cuda.wait_until(scope="sys")` and `atom.cas` spins |
 
 ## Ordering and race semantics
-
-### Checked semantics
-
-Immediately after decoding a supported peer operation, the checks cover:
-
-- **Reachability:** own private memory and mapped `SymmetricBuffer` replicas
-  are valid; a raw peer address or tensor map into another rank's private
-  allocation is an error.
-- **Physical conflicts:** Racecheck compares overlapping physical bytes for
-  RAW, WAR, and WAW conflicts, including buffer reuse and aliases with
-  different parameter names.
-- **Scope and observation:** cross-rank release/acquire communication requires
-  `.sys`, and an acquire must observe a valid publication or RMW chain.
-- **Proxy visibility and completion:** bulk/TMA reads require the async proxy
-  bridge and completion wait; bulk/TMA writes must complete before publication;
-  multicast-alias crossings require the alias bridge.
-- **Lane participation:** warp/CTA synchronization must carry non-signaling
-  lanes into the release and out of the acquire.
-- **Liveness:** Synccheck checks modeled waits, barriers, and pending async
-  completions; a completed poll alone is not proof of data visibility.
-
-The related rule table and named positive/negative tests follow before the
-usage examples. A clean result covers the supplied TIRx specialization,
-inputs, and executed path only.
-
-### Check contract and memory-ordering rules
 
 The [multimem check contract](MULTI_GPU_MULTIMEM.md#check-contract-and-limits)
 also applies here: analysis executes TIRx IR with concrete bindings, and a
@@ -98,20 +72,6 @@ for the specification, and the
 measurements and outstanding gates. Mega MoE currently has an
 `alias_stale_read` advisory and therefore a `review` verdict, not `clean`.
 
-### Operation details
-
-Every global-memory instruction NumSim models accepts a peer address. The
-address resolves to the peer replica's allocation in the launch's shared
-global arena, and the access runs through the ordinary engine path:
-
-| Kind | Forms exercised by the tests |
-|---|---|
-| Loads and stores | `ld`/`st` weak, `.relaxed`, `.acquire`/`.release` at `.gpu`/`.sys`, `.v4` vectors |
-| Atomics | `atom.add`, `atom.cas` (`.relaxed`/`.acquire`, `.gpu`/`.sys`), `red.add` (`.relaxed`/`.release`), 32- and 64-bit |
-| Bulk copies | `cp.async.bulk` global to shared (`mbarrier::complete_tx`) and shared to global (`bulk_group`) |
-| TMA | `cp.async.bulk.tensor` loads and stores through a `TensorMap` over a peer's replica |
-| Polls | `T.cuda.wait_until(scope="sys")` and `atom.cas` spins |
-
 ## Related tests
 
 `tests/numsim/support/peer_litmus.py` runs one warp per rank and takes scalar
@@ -145,20 +105,9 @@ unordered, not merely an `error` verdict.
 | `tests/analysis_tools/racecheck/test_native_peer_kernels.py` | Both ported kernels, world 2 and 4: the all-gather GEMM is clean with both epilogues, and stale flags let its TMA loads run ahead of the copies; its barrier is clean; mega MoE is clean except for one advisory |
 | `tests/analysis_tools/synccheck/test_native_peer_kernels.py` | Both ported kernels complete; a barrier with a wrong peer offset deadlocks the skipped rank |
 
-The mega MoE advisory is `alias_stale_read`: combine reuses the shared-pool
-prefix that dispatch named `smem_expert_count`. The single-GPU corpus case
-reports the same advisory. Physical ordering, within a rank and across the
-symmetric buffers, has no finding. The advisory is about names, not values:
-- **What it flags:** the first epilogue warp's 16-byte `ld.shared` of its
-  combine chunk (`kernel.py`, `lds128`) reads the pool's first 32 bytes, which
-  warp 0 last wrote, by name, as `smem_expert_count` (8 experts x 4 bytes at
-  this size).
-- **Why it is not stale:** the chunk's bytes come from the warp's own
-  `cp.async.bulk` load, which the read follows through the load's mbarrier.
-  The engine records raw bulk copies without a logical buffer name, and the
-  alias tracker skips unnamed writes, so the name it compares against is
-  still dispatch's. Physical race checking does see the bulk write, and
-  NumSim's output equals the reference.
+Mega MoE currently returns `review` for one `alias_stale_read` advisory,
+with no physical race findings in the covered case. The
+[implementation explanation](#shared-pool-alias-advisory) describes this limitation.
 
 ## Using it
 
@@ -276,6 +225,23 @@ in one of two ways:
   (8.7). The litmus kernels use this, as CUTLASS's and FlashInfer's barriers
   do.
 - **`T.cuda.wait_until`**, which declares the spin. Both ports use this.
+
+### Shared-pool alias advisory
+
+The mega MoE advisory is `alias_stale_read`: combine reuses the shared-pool
+prefix that dispatch named `smem_expert_count`. The single-GPU corpus case
+reports the same advisory. Physical ordering, within a rank and across the
+symmetric buffers, has no finding. The advisory is about names, not values:
+- **What it flags:** the first epilogue warp's 16-byte `ld.shared` of its
+  combine chunk (`kernel.py`, `lds128`) reads the pool's first 32 bytes, which
+  warp 0 last wrote, by name, as `smem_expert_count` (8 experts x 4 bytes at
+  this size).
+- **Why it is not stale:** the chunk's bytes come from the warp's own
+  `cp.async.bulk` load, which the read follows through the load's mbarrier.
+  The engine records raw bulk copies without a logical buffer name, and the
+  alias tracker skips unnamed writes, so the name it compares against is
+  still dispatch's. Physical race checking does see the bulk write, and
+  NumSim's output equals the reference.
 
 ### ABI
 

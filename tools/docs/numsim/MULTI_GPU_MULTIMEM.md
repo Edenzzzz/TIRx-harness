@@ -13,51 +13,63 @@ ISA's "Memory Consistency Model" chapter.
 
 ## Supported operations
 
-The layer checks these TIRx forms before GPU execution:
+| Op | Forms |
+|---|---|
+| `tirx.ptx.multimem_ld_reduce{,_f,_f_vec}` | `.add/.min/.max/.and/.or/.xor` over `u32 s32 u64 s64 b32 b64 f16 f16x2 bf16 bf16x2 f32 f64` as the ISA table allows, `.acc::f32` for halves, `.weak` or `.relaxed/.acquire` with `.cta/.cluster/.gpu/.sys`, `.v2/.v4/.v8` |
+| `tirx.ptx.multimem_st{,_f,_f_vec}` | `.weak` or `.relaxed/.release` with a scope, vector forms |
+| `tirx.ptx.multimem_red{,_f,_f_vec}` | `.add/.min/.max/.and/.or/.xor`, `.relaxed/.release` with a scope; an omitted pair is `.relaxed.sys` |
+| `tirx.ptx.fence_proxy` with `proxykind=alias` | `fence.proxy.alias` |
+| `tirx.nvshmem.my_pe`, `tirx.nvshmem.n_pes` | launch rank and world size |
 
-- `multimem.ld_reduce`, `multimem.st`, and `multimem.red` on `.global`
-  multicast windows, with the supported integer, floating-point, reduction,
-  semantic, scope, and vector combinations listed in the operation table
-  below.
-- `fence.proxy.alias` for visibility between multicast-alias and generic
-  accesses.
-- `nvshmem.my_pe` and `nvshmem.n_pes` for rank and world-size queries.
+An access is 32, 64, or 128 bits wide and aligned to its width. The
+`.global` state space is the only one accepted.
 
-The negative tests also verify rejected state spaces, invalid type/reduction
-combinations, invalid semantic/scope pairs, unsupported widths, and address-kind
-misuse. Unsupported async multimem copy/reduction forms remain explicitly
-unsupported.
+Still rejected: `multimem.cp.async.bulk`, `multimem.cp.reduce.async.bulk`
+(including `.f32` without `.ftz`), `multimem.red.async`, `multimem.st.async`,
+and fp8 element types. ptxas itself rejects `multimem.ld_reduce` on
+`e4m3`/`e5m2` for sm_100a, sm_100f, and sm_103a. `engine-rs/SUPPORTED_OPS.md`
+carries each row's fidelity note.
 
 ## Ordering and race semantics
 
-### Checked semantics
+### Memory ordering rules
 
-Immediately after decoding a supported operation, the checks cover:
+Racecheck checks reads after writes (RAW), writes after reads (WAR), and
+writes after writes (WAW) to overlapping physical bytes, even when different
+parameters or multicast/unicast addresses name them. A conflict needs the
+required causal ordering or applicable strong-access atomicity. These are
+the obligations checked for the supported operations:
 
-- **Address validity:** only multimem operations may access a multicast
-  window; a multimem operation must address a window; alignment, bounds, and
-  replica reachability must hold.
-- **Scope and strength:** `.sys` is required for cross-rank publication and
-  observation; `.gpu` and narrower scopes do not order other ranks. Strong
-  atomics and RMW release sequences are checked for moral strength.
-- **Release/acquire:** the release and acquire patterns must cover the
-  communicating actors, the acquire must observe the release or its valid RMW
-  chain, and operations outside the fence pattern are not published or
-  acquired.
-- **Proxy visibility:** generic and multicast-alias accesses need an alias
-  proxy bridge on the causal path. Async/TMA accesses also need completion and
-  the required async proxy fence.
-- **Causality and lanes:** warp/CTA participation must carry writes into the
-  release and reads out of the acquire; a lane-0 signal does not implicitly
-  publish unrelated lanes.
-- **Liveness:** Synccheck distinguishes a completed but weakly ordered wait
-  from a wait that cannot complete, and reports whole-launch deadlock only when
-  no modeled participant or pending completion can progress.
+| Operations | Semantics checked |
+|---|---|
+| `multimem.ld_reduce`, `st`, and `red` | The address must belong to a multicast window; each access must satisfy alignment and bounds. Ordinary `ld`/`st`/atomics on that window are invalid. A multimem access affects its replicas, but is not one atomic transaction across the entire replica set. |
+| Strong `multimem.st`/`red` and their unicast counterparts | Scope must include the other thread. Cross-rank communication requires `.sys`; `.gpu`, `.cluster`, and `.cta` cannot cover another GPU. Concurrent weak stores race. Strong operations do not automatically publish unrelated data. |
+| Release arrival followed by an acquire read/poll | The acquire must observe the release's write, directly or through a qualifying read-modify-write (RMW) chain. Each relevant link must have the required strength and scope. A flag preinitialized to the target value provides no such observation. |
+| `fence.acq_rel.sys` + relaxed arrival; relaxed strong poll + `fence.acq_rel.sys` | The release pattern publishes only accesses before its release fence; the acquire pattern orders only accesses after its acquire fence. A weak poll, a bare relaxed poll, and a reduction's internal read cannot substitute for the required acquire pattern. |
+| `fence.proxy.alias` | A generic access and a multicast-alias access to the same data need an alias fence on their causal path, in either direction. A fence before the producer's write or after the consumer's read is ineffective. Warp/CTA ordering alone does not bridge the alias. |
+| Multicast flag arrival and unicast strong polling | The checked NVLS idiom permits a `.sys` release reduction and strong acquire poll on the same flag without an alias fence on that flag. The payload data still needs its own applicable alias bridge. |
+| `bar.warp.sync` / CTA synchronization around a signal and wait | The signaling lane must first acquire the participating lanes' writes, and the consuming lanes must acquire the waiting lane's dependency. A lane-0 signal does not implicitly publish every lane or warp. |
+| Bulk/TMA stores followed by multimem reads | Shared staging writes need the generic-to-async visibility fence. Global destination writes must complete before publication; `wait_group.read` only completes the source reads. Multicast consumption also needs the alias bridge. A full `wait_group 0` supplies the store's completion dependency, so the tested completed-store path needs no extra async fence. |
+| Bulk/TMA loads consumed by MMA or ordinary shared reads | The consumer must wait for the load's `mbarrier::complete_tx` completion before accessing the destination. Merely issuing a copy or using the same barrier address supplies no wait dependency. |
 
-The rule map and named positive/negative tests immediately below are the
-evidence for each item. A clean result covers the supplied TIRx specialization,
-inputs, and executed path; it does not enumerate alternate inputs or
-unmodeled PTX forms.
+For `ld_reduce`, the check concerns every accessed replica, not just the
+returned reduced value. Numerically equal results do not prove ordering.
+Alias-path counterexamples can fail even within one rank. Findings identify
+the source accesses and overlap; cross-rank scope failures carry
+`scope_mismatch`, and missing ingredients are reported as
+`missing_inter_actor_sync` or `missing_proxy_bridge`.
+
+### Synchronization and liveness
+
+Synccheck checks barrier participants, arrivals, asynchronous completion, and
+wait obligations for the selected program. A flag wait can complete while its
+memory ordering is invalid; Racecheck diagnoses that separate failure.
+
+A silent rank, arrivals on a different word, a store substituted for an
+incrementing reduction, or an expected count greater than the participating
+ranks can leave the launch deadlocked. Deadlock requires that no modeled
+participant or pending completion can make progress. Reaching an exploration
+or resource limit is `incomplete`, not proof of deadlock.
 
 ### Check contract and limits
 
@@ -98,93 +110,6 @@ this is not a claim to implement every PTX multimem instruction.
 **Draft validation:** existing GPU measurements and their limits are preserved.
 The current branch still needs fresh native/GPU validation; see the
 [validation status and resume checklist](MULTI_GPU_VALIDATION.md).
-
-### Operation details
-
-| Op | Forms |
-|---|---|
-| `tirx.ptx.multimem_ld_reduce{,_f,_f_vec}` | `.add/.min/.max/.and/.or/.xor` over `u32 s32 u64 s64 b32 b64 f16 f16x2 bf16 bf16x2 f32 f64` as the ISA table allows, `.acc::f32` for halves, `.weak` or `.relaxed/.acquire` with `.cta/.cluster/.gpu/.sys`, `.v2/.v4/.v8` |
-| `tirx.ptx.multimem_st{,_f,_f_vec}` | `.weak` or `.relaxed/.release` with a scope, vector forms |
-| `tirx.ptx.multimem_red{,_f,_f_vec}` | `.add/.min/.max/.and/.or/.xor`, `.relaxed/.release` with a scope; an omitted pair is `.relaxed.sys` |
-| `tirx.ptx.fence_proxy` with `proxykind=alias` | `fence.proxy.alias` |
-| `tirx.nvshmem.my_pe`, `tirx.nvshmem.n_pes` | launch rank and world size |
-
-An access is 32, 64, or 128 bits wide and aligned to its width. The
-`.global` state space is the only one accepted.
-
-Still rejected: `multimem.cp.async.bulk`, `multimem.cp.reduce.async.bulk`
-(including `.f32` without `.ftz`), `multimem.red.async`, `multimem.st.async`,
-and fp8 element types. ptxas itself rejects `multimem.ld_reduce` on
-`e4m3`/`e5m2` for sm_100a, sm_100f, and sm_103a. `engine-rs/SUPPORTED_OPS.md`
-carries each row's fidelity note.
-
-### Memory ordering rules
-
-Racecheck matches overlapping physical bytes, including a replica reached through
-both its multicast and unicast addresses. The rule implementation is
-`engine-rs/src/native_analysis/racecheck/global_race.rs`.
-
-- **Cross-rank relation:**
-  - **Actor relation.** Findings between ranks report
-    `actor_relation: "cross_rank"` (`GlobalActorRelation::CrossRank`).
-  - **Scope.** A scope covers a pair only if it reaches both actors, so
-    `.gpu` and narrower scopes order nothing across ranks and yield
-    `scope_mismatch` findings.
-  - **Acquire fast path.** `launch_wide_scope` lifts the acquire fast path's
-    floor from `.gpu` to `.sys` once a launch spans ranks
-    (`ReleasePayload::every_head_acquirable_by`).
-- **Alias proxy bridges:**
-  - **Bridging.** `fence.proxy.alias` (`ProxyAsyncFenceScope::Alias`, applied
-    by `apply_proxy_alias_fence`) bridges generic and multicast-alias accesses
-    in both directions.
-  - **Async to alias.** An async-proxy access, such as a TMA store, reaches a
-    multicast-alias access only through both fences in order. A
-    `fence.proxy.alias` turns the async-to-generic bridge already recorded
-    into `AsyncToAlias`. A `fence.proxy.async` turns the alias-to-generic
-    bridge already recorded into `AliasToAsync`.
-  - **Placement.** A bridge counts only along the synchronization path (8.9.5);
-    an alias fence before the writes or after the reads bridges nothing.
-  - **Shared memory** has no modeled virtual aliases, so the alias fence is
-    global-only there (`race_shadow.rs`).
-- **Coherent strong atomics:**
-  - **Rule.** `MemoryProxy::atomics_cohere` treats strong atomics through the
-    generic and multicast-alias proxies as atomics on one location. A
-    multimem atomic is performed at each replica.
-  - **What it enables.** The NVLS flag idiom therefore works without an alias
-    fence on the flag itself: arrive with `multimem.red.release.sys`, then
-    poll the unicast flag with an acquire.
-  - **Where it applies.** The same relation is used for moral strength,
-    scope-mismatch detection, release-sequence (RMW chain) ancestry, and the
-    acquire's head check. Data published through the barrier still needs the
-    alias fence.
-- **Which ingredient is reported missing:** `global_ordering_failure` names
-  the first missing ingredient.
-  - **Alias pairs.** For a pair involving the alias proxy, a missing bridge is
-    reported (`missing_proxy_bridge`) only when ordinary synchronization
-    already orders the pair, or both accesses are in one warp. Otherwise the
-    race is `missing_inter_actor_sync`.
-  - **Async-proxy pairs.** These still report the bridge first, because async
-    completion is not in the generic clocks.
-
-### Synchronization and liveness
-
-Synccheck has no multimem-specific code:
-- **Liveness:** all ranks' warps run in one launch, so a cross-rank flag spin
-  is an ordinary polling actor, and a flag that can never reach its target is
-  a whole-launch deadlock listing every rank's blocked warps.
-- **Fence resource:** `fence.proxy.alias` maps to the global proxy-fence
-  resource (`resolved_transition.rs`).
-- **Scope of the verdict:** Synccheck decides whether waits complete, not what
-  they order. The ordering counterexamples below are clean under Synccheck by
-  design, and Racecheck holds each of them to its races.
-
-A TMA/bulk load's `mbarrier::complete_tx` contributes completion only after its
-async write. A successful wait on the associated barrier supplies the modeled
-dependency for subsequent consumers; an issued copy or a matching barrier
-address without that wait does not. For a bulk/TMA store,
-`cp.async.bulk.wait_group.read` permits reuse of its source after the reads
-finish; publishing its destination requires full completion. The GEMM tests
-include both a skipped load wait and a read-only store wait.
 
 ## Related tests
 
@@ -244,34 +169,6 @@ cases of the new ops, which `test_operation_runtime_cases.py` requires.
 The tests skip unless the host has enough SM100 GPUs with
 `CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED`. They target sm_100a; the GB200
 numerics above were measured with them.
-
-### Running
-
-From `tools/`:
-
-```bash
-python -m pytest -q -n 16 \
-  tests/numsim/runtime/test_multimem.py \
-  tests/numsim/runtime/test_multimem_kernels.py \
-  tests/analysis_tools/racecheck/test_native_multimem.py \
-  tests/analysis_tools/racecheck/test_native_multimem_kernels.py \
-  tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py \
-  tests/analysis_tools/synccheck/test_native_multimem.py \
-  tests/analysis_tools/synccheck/test_native_multimem_kernels.py \
-  tests/analysis_tools/synccheck/test_native_multimem_ordering_rules.py
-
-# Live GPU comparison; -n 1 keeps multi-GPU launches from sharing devices.
-python -m pytest -q -n 1 tests/numsim/microtests/test_multimem.py
-
-(cd src/tirx_harness/numsim/engine-rs && cargo test --all-features)
-```
-
-The engine's `numpy_backend` tests embed Python and import numpy, so run
-`cargo test` with the project's venv active.
-
-The frontend gate is `cargo test --release` in `frontend-rs/`. Its test binary
-needs the environment's `tvm_ffi` on the library path: activate the venv that
-provides `tvm-ffi-config`, and add `tvm_ffi/lib` to `LD_LIBRARY_PATH`.
 
 ## Using it
 
@@ -470,6 +367,66 @@ discard its staged batch (`race_check.rs`). Before this, a failed write left
 its spans in flight, and an overlapping atomic on another warp spun forever in
 `wait_for_quiescent_global_spans`. That is how a plain `red` to a multicast
 window used to hang instead of erroring.
+
+### Racecheck implementation
+
+Racecheck matches overlapping physical bytes, including a replica reached through
+both its multicast and unicast addresses. The rule implementation is
+`engine-rs/src/native_analysis/racecheck/global_race.rs`.
+
+- **Cross-rank relation:**
+  - **Actor relation.** Findings between ranks report
+    `actor_relation: "cross_rank"` (`GlobalActorRelation::CrossRank`).
+  - **Scope.** A scope covers a pair only if it reaches both actors, so
+    `.gpu` and narrower scopes order nothing across ranks and yield
+    `scope_mismatch` findings.
+  - **Acquire fast path.** `launch_wide_scope` lifts the acquire fast path's
+    floor from `.gpu` to `.sys` once a launch spans ranks
+    (`ReleasePayload::every_head_acquirable_by`).
+- **Alias proxy bridges:**
+  - **Bridging.** `fence.proxy.alias` (`ProxyAsyncFenceScope::Alias`, applied
+    by `apply_proxy_alias_fence`) bridges generic and multicast-alias accesses
+    in both directions.
+  - **Async to alias.** An async-proxy access, such as a TMA store, reaches a
+    multicast-alias access only through both fences in order. A
+    `fence.proxy.alias` turns the async-to-generic bridge already recorded
+    into `AsyncToAlias`. A `fence.proxy.async` turns the alias-to-generic
+    bridge already recorded into `AliasToAsync`.
+  - **Placement.** A bridge counts only along the synchronization path (8.9.5);
+    an alias fence before the writes or after the reads bridges nothing.
+  - **Shared memory** has no modeled virtual aliases, so the alias fence is
+    global-only there (`race_shadow.rs`).
+- **Coherent strong atomics:**
+  - **Rule.** `MemoryProxy::atomics_cohere` treats strong atomics through the
+    generic and multicast-alias proxies as atomics on one location. A
+    multimem atomic is performed at each replica.
+  - **What it enables.** The NVLS flag idiom therefore works without an alias
+    fence on the flag itself: arrive with `multimem.red.release.sys`, then
+    poll the unicast flag with an acquire.
+  - **Where it applies.** The same relation is used for moral strength,
+    scope-mismatch detection, release-sequence (RMW chain) ancestry, and the
+    acquire's head check. Data published through the barrier still needs the
+    alias fence.
+- **Which ingredient is reported missing:** `global_ordering_failure` names
+  the first missing ingredient.
+  - **Alias pairs.** For a pair involving the alias proxy, a missing bridge is
+    reported (`missing_proxy_bridge`) only when ordinary synchronization
+    already orders the pair, or both accesses are in one warp. Otherwise the
+    race is `missing_inter_actor_sync`.
+  - **Async-proxy pairs.** These still report the bridge first, because async
+    completion is not in the generic clocks.
+
+### Synccheck implementation
+
+Synccheck has no multimem-specific code:
+- **Liveness:** all ranks' warps run in one launch, so a cross-rank flag spin
+  is an ordinary polling actor, and a flag that can never reach its target is
+  a whole-launch deadlock listing every rank's blocked warps.
+- **Fence resource:** `fence.proxy.alias` maps to the global proxy-fence
+  resource (`resolved_transition.rs`).
+- **Scope of the verdict:** Synccheck decides whether waits complete, not what
+  they order. The ordering counterexamples below are clean under Synccheck by
+  design, and Racecheck holds each of them to its races.
 
 ### ABI
 
@@ -808,3 +765,31 @@ Two changes closed the last gaps:
   - Under FlashInfer's protocol the same fence costs more than it saves
     (1.02× to 1.04× with it, 0.98× to 0.99× without), so that protocol does not
     use it.
+
+## Running
+
+From `tools/`:
+
+```bash
+python -m pytest -q -n 16 \
+  tests/numsim/runtime/test_multimem.py \
+  tests/numsim/runtime/test_multimem_kernels.py \
+  tests/analysis_tools/racecheck/test_native_multimem.py \
+  tests/analysis_tools/racecheck/test_native_multimem_kernels.py \
+  tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py \
+  tests/analysis_tools/synccheck/test_native_multimem.py \
+  tests/analysis_tools/synccheck/test_native_multimem_kernels.py \
+  tests/analysis_tools/synccheck/test_native_multimem_ordering_rules.py
+
+# Live GPU comparison; -n 1 keeps multi-GPU launches from sharing devices.
+python -m pytest -q -n 1 tests/numsim/microtests/test_multimem.py
+
+(cd src/tirx_harness/numsim/engine-rs && cargo test --all-features)
+```
+
+The engine's `numpy_backend` tests embed Python and import numpy, so run
+`cargo test` with the project's venv active.
+
+The frontend gate is `cargo test --release` in `frontend-rs/`. Its test binary
+needs the environment's `tvm_ffi` on the library path: activate the venv that
+provides `tvm-ffi-config`, and add `tvm_ffi/lib` to `LD_LIBRARY_PATH`.
