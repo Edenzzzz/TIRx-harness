@@ -3,6 +3,10 @@
 
     python -m benchmarks.multimem.two_shot_all_reduce [--world 4] [--shapes 1024x1024 ...]
 
+Run the CPU preflight first:
+
+    python -m benchmarks.multimem.numsim_preflight --world 4
+
 The CUTLASS kernel is imported unchanged from ``$CUTLASS_DIR``; ``origins``
 restates only its host wrapper, to launch on the capturing stream.
 """
