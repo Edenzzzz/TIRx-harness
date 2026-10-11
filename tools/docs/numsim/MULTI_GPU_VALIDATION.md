@@ -20,7 +20,7 @@ That run used Rust 1.99 and Python 3.11, with the native extension staged
 manually after the wheel rejected Python 3.11. It demonstrates those CPU
 checks executing, but does not pass the installation gate: the package
 requires Python 3.12 or 3.13, and the native tests must also be repeated in a
-supported installed environment. The full Rust and parent-package suites
+supported installed environment. The full Linux Rust and parent-package suites
 remain pending.
 
 The live GPU suite has not passed. Its first attempt lacked `cuda.bindings`;
@@ -37,6 +37,23 @@ one/two-CTA builds, fixed/runtime rank, and explicit origin-ordering opt-in;
 10 benchmark-evidence tests reject stale/missing/incorrect or slow results.
 These do not execute the kernel's memory effects. The new full-kernel
 NumSim/Racecheck/Synccheck tests and GPU comparisons remain unrun.
+
+The subsequent engine checks reproduced and corrected acceptance of invalid
+multimem specializations and stale provenance after unnamed writes. The nine
+multimem Rust tests pass. The complete Rust suite on macOS reports 770 passing
+and 113 failing tests; an untouched `6b24e8c` engine snapshot reports 763 passing
+and the exact same 113 failures. All seven added regression tests pass. The
+failure-set comparison introduces no new failures, but is not a successful
+Linux gate: macOS execution is blocked by the engine's unsupported worker
+floating-point environment. The installed native frontend still lowers all
+28 existing multimem instruction cases. The new bulk-copy provenance kernel
+also lowers; execution of it and the complete Mega MoE case remains pending.
+
+The ABI/support-matrix tests and the 29 IR/evidence tests pass together:
+**32 passed in 7.62 seconds** with four pytest workers. The broader registry
+run exposed the stale ABI header, now corrected; its other 16 failures require
+generated native modules that could not link CPython symbols on macOS. Those
+execution-dependent checks still need the supported Linux environment.
 
 Local handoff checks passed for all 52 changed Python files' syntax, one JSON
 result file and 11,950 JSONL records, 37 local documentation links, 32 named
@@ -79,12 +96,15 @@ are historical reports; they have not been reproduced on this branch.
   remains an explicit negative control. Run those tests, then measure the
   corrected kernel across the complete shape matrix. Comparison rows now
   record the ordering mode, and the gate cannot reuse old signaling results.
-- **Mega MoE is `review`, not `clean`.** Its test requires zero physical race
-  findings and one `alias_stale_read` advisory. The
-  [provenance explanation](MULTI_GPU_PEER.md#shared-pool-alias-advisory) describes
-  the unnamed bulk-copy write that leaves an old shared-pool name visible to
-  the alias tracker. Resolve or explicitly adjudicate the advisory; do not
-  silently drop it or reinterpret `review` as a clean result.
+- **Mega MoE's provenance correction needs an end-to-end rerun.** The prior
+  result was `review` for one `alias_stale_read` advisory. Focused Rust
+  regressions now verify invalidation of overwritten named provenance,
+  including partial and sparse writes, without discarding earlier findings.
+  The full-kernel test now requires `clean`, but has not run with this change.
+  The [provenance explanation](MULTI_GPU_PEER.md#shared-pool-alias-advisory) describes
+  the completed unnamed bulk-copy write and correction. Rerun the Linux alias
+  tests, peer kernels, wiki corpus, and relevant performance gates before
+  recording a clean result or revising corpus advisory goldens.
 - **Coverage is bounded.** Async multimem copy/reduction/store families and
   fp8 forms are not modeled. The supported-operation table and rejection
   paths must stay consistent. The numerical model has GB200-specific floating
@@ -98,7 +118,7 @@ are historical reports; they have not been reproduced on this branch.
 
 ## Resume gates
 
-1. Restore the compatible harness environment on a 4× GB200 host, initialize
+1. Restore the compatible harness environment on a four-GPU Linux host, initialize
    the pinned `thirdparty/tvm-rust-ext` submodule, and install this branch.
    Follow [`tests/AGENTS.md`](../../tests/AGENTS.md); do not substitute an
    unrelated TVM wheel. Record the branch commit, GPU/driver/toolkit versions,

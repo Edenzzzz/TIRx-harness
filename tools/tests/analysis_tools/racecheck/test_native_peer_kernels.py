@@ -73,16 +73,13 @@ def test_all_gather_barrier_is_clean(world, kernel_cache):
     assert report.native_payload["findings"] == []
 
 
-def test_mega_moe_expert_parallel_is_clean_but_for_the_pool_alias_advisory(kernel_cache):
-    """Combine reuses the shared-pool prefix that dispatch named
-    ``smem_expert_count``, which the single-GPU corpus case reports as the
-    same single stale-name advisory; physical ordering, within a rank and
-    across the ranks' symmetric buffers, has no finding."""
+def test_mega_moe_expert_parallel_has_no_stale_pool_alias_advisory(kernel_cache):
+    """The completed bulk load replaces dispatch's shared-pool provenance."""
     shape = pm.Shape(world=4)
     rows, _ = pm.rank_inputs(shape)
     report = racecheck(pm.kernel(shape), inputs=rows, cache_dir=kernel_cache)
 
     assert report.native_payload["incomplete"] == []
     assert report.native_payload["findings"] == []
-    assert report.verdict == "review", report.format()
-    assert [item["kind"] for item in report.native_payload["advisories"]] == ["alias_stale_read"]
+    assert report.verdict == "clean", report.format()
+    assert report.native_payload["advisories"] == []

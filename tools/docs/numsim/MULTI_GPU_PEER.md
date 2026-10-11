@@ -27,7 +27,7 @@ The tested forms are:
 | TMA | `cp.async.bulk.tensor` loads and stores through a `TensorMap` over a peer's replica |
 | Polls | `T.cuda.wait_until(scope="sys")` and `atom.cas` spins |
 
-## Ordering and race semantics
+## Semantics checked
 
 The [multimem check contract](MULTI_GPU_MULTIMEM.md#check-contract-and-limits)
 also applies here: analysis executes TIRx IR with concrete bindings, and a
@@ -64,13 +64,19 @@ shared memory, barriers, and grid coordinates.
    completions can satisfy waits. It does not treat a completed flag poll as
    proof of data visibility. A flag that no actor can advance may prove a
    deadlock; exhausted coverage is `incomplete`.
+7. **Logical alias advisories:** reading a named shared/TMEM view whose bytes
+   were last written under another logical name can produce `alias_stale_read`.
+   An unnamed write invalidates the old name only for bytes it overwrites.
+   Untouched bytes and earlier findings remain; unnamed reads do not erase
+   provenance. These accesses still undergo the physical race checks above.
 
 The tables below pair these rules with positive controls and counterexamples.
 See the [PTX memory model](https://docs.nvidia.com/cuda/parallel-thread-execution/#memory-consistency-model)
 for the specification, and the
 [validation status and resume checklist](MULTI_GPU_VALIDATION.md) for existing
-measurements and outstanding gates. Mega MoE currently has an
-`alias_stale_read` advisory and therefore a `review` verdict, not `clean`.
+measurements and outstanding gates. The prior Mega MoE run had one
+`alias_stale_read` advisory. The provenance correction passes focused Rust
+tests; its effect on the complete kernel still needs Linux validation.
 
 ## Related tests
 
@@ -102,12 +108,18 @@ unordered, not merely an `error` verdict.
 | `tests/numsim/runtime/test_peer.py` | NumSim values: peer stores, loads, atomics, CAS, bulk and TMA in both directions; the reachability errors; `SymmetricBuffer` validation and `peer_offsets`; both ported kernels against their references; the all-gather barrier |
 | `tests/analysis_tools/racecheck/test_native_peer_ordering_rules.py` | The rule table above |
 | `tests/analysis_tools/synccheck/test_native_peer_ordering_rules.py` | Every counterexample still completes (Synccheck checks liveness, not ordering); a rank that never arrives deadlocks its receiver; the reachability errors |
-| `tests/analysis_tools/racecheck/test_native_peer_kernels.py` | Both ported kernels, world 2 and 4: the all-gather GEMM is clean with both epilogues, and stale flags let its TMA loads run ahead of the copies; its barrier is clean; mega MoE is clean except for one advisory |
+| `tests/analysis_tools/racecheck/test_native_peer_kernels.py` | Both ported kernels: the all-gather GEMM covers world 2 and 4 with both epilogues and stale-flag counterexamples; Mega MoE's updated contract requires no stale pool advisory after the completed bulk write (Linux rerun pending). |
 | `tests/analysis_tools/synccheck/test_native_peer_kernels.py` | Both ported kernels complete; a barrier with a wrong peer offset deadlocks the skipped rank |
 
-Mega MoE currently returns `review` for one `alias_stale_read` advisory,
-with no physical race findings in the covered case. The
-[implementation explanation](#shared-pool-alias-advisory) describes this limitation.
+The new
+[bulk-copy regression](../../tests/analysis_tools/racecheck/test_native_alias_advisory.py)
+is `test_completed_bulk_copy_does_not_retain_an_overwritten_logical_name`.
+Focused Rust tests in
+[`race_check.rs`](../../src/tirx_harness/numsim/engine-rs/src/native_analysis/racecheck/race_check.rs)
+cover partial overwrites, indexed/tree storage, sparse/contiguous compact
+accesses, other allocations, anonymous reads, and preservation of prior findings.
+The Python regression and complete Mega MoE rerun remain pending; see the
+[implementation explanation](#shared-pool-alias-advisory).
 
 ## Using it
 
@@ -228,10 +240,10 @@ in one of two ways:
 
 ### Shared-pool alias advisory
 
-The mega MoE advisory is `alias_stale_read`: combine reuses the shared-pool
-prefix that dispatch named `smem_expert_count`. The single-GPU corpus case
-reports the same advisory. Physical ordering, within a rank and across the
-symmetric buffers, has no finding. The advisory is about names, not values:
+The earlier mega MoE run reported `alias_stale_read`: combine reuses the
+shared-pool prefix that dispatch named `smem_expert_count`. The single-GPU
+corpus case reported the same advisory. The recorded run had no physical race
+finding. The advisory's stale writer name came from the following sequence:
 - **What it flags:** the first epilogue warp's 16-byte `ld.shared` of its
   combine chunk (`kernel.py`, `lds128`) reads the pool's first 32 bytes, which
   warp 0 last wrote, by name, as `smem_expert_count` (8 experts x 4 bytes at
@@ -239,9 +251,14 @@ symmetric buffers, has no finding. The advisory is about names, not values:
 - **Why it is not stale:** the chunk's bytes come from the warp's own
   `cp.async.bulk` load, which the read follows through the load's mbarrier.
   The engine records raw bulk copies without a logical buffer name, and the
-  alias tracker skips unnamed writes, so the name it compares against is
-  still dispatch's. Physical race checking does see the bulk write, and
-  NumSim's output equals the reference.
+  old alias tracker skipped unnamed writes, leaving dispatch's name even
+  after the bulk write. The corrected tracker removes named provenance over
+  exactly those written byte ranges, preserving the rest of each interval.
+  It does not change memory effects or physical happens-before checks, nor
+  erase advisories already emitted. The focused Rust regressions reproduce
+  the old attribution and pass with the correction. Linux corpus and kernel
+  reruns must verify the expected advisory changes before updating goldens or
+  claiming that Mega MoE is clean.
 
 ### ABI
 

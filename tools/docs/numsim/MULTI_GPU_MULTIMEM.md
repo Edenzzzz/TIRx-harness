@@ -24,13 +24,17 @@ ISA's "Memory Consistency Model" chapter.
 An access is 32, 64, or 128 bits wide and aligned to its width. The
 `.global` state space is the only one accepted.
 
+Integer and `f64` forms are scalar. Signed `s64` supports min/max, not add;
+floating-point `red` supports add, not min/max. Half-precision load-add supports
+`.acc::f32`. Invalid combinations are rejected.
+
 Still rejected: `multimem.cp.async.bulk`, `multimem.cp.reduce.async.bulk`
 (including `.f32` without `.ftz`), `multimem.red.async`, `multimem.st.async`,
 and fp8 element types. ptxas itself rejects `multimem.ld_reduce` on
 `e4m3`/`e5m2` for sm_100a, sm_100f, and sm_103a. `engine-rs/SUPPORTED_OPS.md`
 carries each row's fidelity note.
 
-## Ordering and race semantics
+## Semantics checked
 
 ### Memory ordering rules
 
@@ -91,15 +95,15 @@ violation), or `incomplete` (insufficient execution/coverage). A resource or
 loop-exploration limit is not proof of deadlock. Inspect the findings and their
 source witnesses; use `require_clean()` when an advisory must also fail a gate.
 
-The model expands a multicast operation into accesses to the replicas' physical
-bytes. It does **not** make the whole replica set one indivisible transaction.
+Multicast atomicity applies per replica, **not** to the whole replica set as
+one indivisible transaction.
 A matching pointer, a flag reaching its target, or a numerically correct
 simulation does not alone establish a happens-before edge. The consumer must
 observe the appropriate release, both endpoints must cover the communicating
 threads, and any required proxy bridge must lie on that causal path.
 
-The rules and counterexamples below describe the implemented scope. The PTX
-references are [multimem addresses and instructions](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-multimem),
+The rules and counterexamples below describe the checked guarantees and limits.
+The PTX references are [multimem addresses and instructions](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-multimem),
 [scopes](https://docs.nvidia.com/cuda/parallel-thread-execution/#scope),
 [proxies](https://docs.nvidia.com/cuda/parallel-thread-execution/#proxies),
 [release/acquire patterns](https://docs.nvidia.com/cuda/parallel-thread-execution/#release-acquire-patterns),
@@ -125,6 +129,11 @@ The current branch still needs fresh native/GPU validation; see the
 | `tests/analysis_tools/synccheck/test_native_multimem_kernels.py` | The two-shot all-reduce's barrier completes, and the GEMM's pipeline barriers and flag spins complete under all three protocols. An MMA skipping its load wait desynchronizes the mbarriers. A kernel built for 4 ranks, launched on 2, never completes. |
 | `tests/numsim/microtests/test_multimem.py` | Live GPU runs against NumSim on 2 and 4 GPUs (next section). |
 | `engine-rs` unit tests | `MultimemForm::decode` against the ISA table, rank-order folds, accumulator-window and rounding cases (`multimem.rs`); rank-local topology (`topology.rs`); abort hooks leave no write in flight (`race_check.rs`). |
+
+The decoder regressions in
+[`runtime/instructions/multimem.rs`](../../src/tirx_harness/numsim/engine-rs/src/runtime/instructions/multimem.rs)
+pair rejected integer/f64 vectors, signed-64 addition, and half-precision
+reduction min/max with accepted scalar min/max and floating-vector boundaries.
 
 The full-scale GEMM port also has direct tests. The IR and benchmark-evidence
 checks pass locally; the numerical and native checker rows still need execution

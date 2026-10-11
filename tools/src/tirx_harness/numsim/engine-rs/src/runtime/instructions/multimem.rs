@@ -156,6 +156,20 @@ impl MultimemForm {
         if !matches!(vec, 1 | 2 | 4 | 8) {
             return invalid("vector width");
         }
+        if vec != 1
+            && matches!(
+                element,
+                Element::U32
+                    | Element::S32
+                    | Element::U64
+                    | Element::S64
+                    | Element::B32
+                    | Element::B64
+                    | Element::F64
+            )
+        {
+            return invalid("integer and f64 forms require scalar registers");
+        }
         let byte_width = register_bytes * usize::from(vec);
         if !matches!(byte_width, 4 | 8 | 16) {
             return invalid("access width must be 32, 64, or 128 bits");
@@ -170,12 +184,14 @@ impl MultimemForm {
         }
         let reduction_fits = match reduction {
             Reduction::None => true,
-            Reduction::Add => !matches!(element, Element::B32 | Element::B64),
+            Reduction::Add => !matches!(element, Element::S64 | Element::B32 | Element::B64),
             Reduction::AddAccF32 => element.is_half(),
-            Reduction::Min | Reduction::Max => !matches!(
-                element,
-                Element::B32 | Element::B64 | Element::F32 | Element::F64
-            ),
+            Reduction::Min | Reduction::Max => {
+                matches!(
+                    element,
+                    Element::U32 | Element::S32 | Element::U64 | Element::S64
+                ) || (kind == Kind::LdReduce && element.is_half())
+            }
             Reduction::And | Reduction::Or | Reduction::Xor => {
                 matches!(element, Element::B32 | Element::B64)
             }
@@ -843,14 +859,64 @@ mod tests {
 
     #[test]
     fn decode_rejects_forms_outside_the_isa_table() {
-        // f16 scalar is 16 bits; s64 add is fine for the engine but not
-        // `.and` on u32; `.acc::f32` needs a half type; weak red is illegal.
         assert!(MultimemForm::decode(0, 6, 1, 1, 0, 3).is_err());
         assert!(MultimemForm::decode(0, 0, 5, 1, 0, 3).is_err());
         assert!(MultimemForm::decode(0, 10, 2, 1, 0, 3).is_err());
         assert!(MultimemForm::decode(2, 0, 1, 1, 0, 3).is_err());
         assert!(MultimemForm::decode(1, 0, 1, 1, 0, 3).is_err());
         assert!(MultimemForm::decode(0, 10, 3, 1, 0, 3).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_integer_and_f64_vectors() {
+        for kind in 0..=2 {
+            for type_code in [0, 1, 2, 3, 4, 5, 11] {
+                let operation = if kind == 1 {
+                    0
+                } else if matches!(type_code, 4 | 5) {
+                    5
+                } else if type_code == 3 {
+                    3
+                } else {
+                    1
+                };
+                let semantic = if kind == 2 { 1 } else { 0 };
+                assert!(
+                    MultimemForm::decode(kind, type_code, operation, 2, semantic, 3).is_err(),
+                    "kind {kind}, type {type_code} must remain scalar"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_rejects_signed64_add_and_half_red_minmax() {
+        for kind in [0, 2] {
+            assert!(MultimemForm::decode(kind, 3, 1, 1, 1, 3).is_err());
+        }
+        for type_code in [6, 7, 8, 9] {
+            let registers = if matches!(type_code, 6 | 8) { 2 } else { 1 };
+            for operation in [3, 4] {
+                assert!(MultimemForm::decode(2, type_code, operation, registers, 1, 3).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn decode_preserves_supported_scalar_and_vector_boundaries() {
+        for kind in 0..=2 {
+            let operation = if kind == 1 { 0 } else { 1 };
+            assert!(MultimemForm::decode(kind, 2, operation, 1, 1, 3).is_ok());
+            assert!(MultimemForm::decode(kind, 11, operation, 1, 1, 3).is_ok());
+            assert!(MultimemForm::decode(kind, 10, operation, 4, 1, 3).is_ok());
+        }
+        for kind in [0, 2] {
+            for operation in [3, 4] {
+                assert!(MultimemForm::decode(kind, 3, operation, 1, 1, 3).is_ok());
+            }
+        }
+        assert!(MultimemForm::decode(0, 6, 2, 8, 2, 3).is_ok());
+        assert!(MultimemForm::decode(2, 7, 1, 4, 3, 3).is_ok());
     }
 
     #[test]
