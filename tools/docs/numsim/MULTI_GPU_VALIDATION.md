@@ -36,7 +36,7 @@ under Python 3.13.2, TVM 0.27.0.post1, and TIRx-kernels 0.1.2.post1:
 19 IR contract tests cover system-scope arrivals/polls, alias fences,
 one/two-CTA builds, fixed/runtime rank, and explicit origin-ordering opt-in;
 10 benchmark-evidence tests reject stale/missing/incorrect or slow results.
-These do not execute the kernel's memory effects. The new full-kernel
+These do not execute the kernel's memory effects. The new full-scale GEMM
 NumSim/Racecheck/Synccheck tests and GPU comparisons remain unrun.
 
 The subsequent engine checks reproduced and corrected acceptance of invalid
@@ -55,6 +55,14 @@ The ABI/support-matrix tests and the 29 IR/evidence tests pass together:
 run exposed the stale ABI header, now corrected; its other 16 failures require
 generated native modules that could not link CPython symbols on macOS. Those
 execution-dependent checks still need the supported Linux environment.
+
+The pushed benchmark preflight was then run in the supported Linux environment
+with Python 3.13.16, TVM 0.27.0.post1, TIRx-kernels 0.1.2.post1, and Rust 1.99:
+two ranks, four ranks, and four ranks with two CTAs per rank all passed
+NumSim, Racecheck, and Synccheck. A separate four-rank GPU run of the same
+two-shot TIRx kernel matched the float64 reference and left every flag reset,
+under the shared GPU lease. The GPU check is a correctness spot check, not the
+full performance matrix or the full-scale GEMM gate.
 
 Local handoff checks passed for all 52 changed Python files' syntax, one JSON
 result file and 11,950 JSONL records, 37 local documentation links, 32 named
