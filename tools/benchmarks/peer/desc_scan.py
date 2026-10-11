@@ -150,7 +150,7 @@ def _all_gather_builds(world: int, clusters: dict[int, int]):
 
 def _gemm_all_reduce_builds(world: int, clusters: dict[int, int]):
     from benchmarks.multimem.gemm_all_reduce import RESULTS, SHAPES_BY_NAME
-    from tests.numsim.support.multimem_gemm_all_reduce import gemm_all_reduce
+    from ported.cutlass.sm100_gemm_all_reduce import gemm_all_reduce
 
     seen = set()
     for line in (RESULTS / "gemm_all_reduce_gb200x4.jsonl").read_text().splitlines():
@@ -174,7 +174,7 @@ def _gemm_all_reduce_builds(world: int, clusters: dict[int, int]):
 
 def _two_shot_builds(world: int, clusters: dict[int, int]):
     from benchmarks.multimem.two_shot_all_reduce import SHAPES
-    from tests.numsim.support.multimem_kernels import TILE, two_shot_all_reduce
+    from ported.cutlass.sm100_all_reduce import TILE, two_shot_all_reduce
 
     for shape in SHAPES:
         yield f"{shape[0]}x{shape[1]}", lambda shape=shape: [

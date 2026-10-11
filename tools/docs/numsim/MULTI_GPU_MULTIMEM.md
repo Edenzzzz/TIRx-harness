@@ -126,6 +126,18 @@ The current branch still needs fresh native/GPU validation; see the
 | `tests/numsim/microtests/test_multimem.py` | Live GPU runs against NumSim on 2 and 4 GPUs (next section). |
 | `engine-rs` unit tests | `MultimemForm::decode` against the ISA table, rank-order folds, accumulator-window and rounding cases (`multimem.rs`); rank-local topology (`topology.rs`); abort hooks leave no write in flight (`race_check.rs`). |
 
+The full-scale GEMM port also has direct tests. The IR and benchmark-evidence
+checks pass locally; the numerical and native checker rows still need execution
+in the restored validation environment:
+
+| File | Obligation |
+|---|---|
+| [Full-kernel IR checks](../../tests/numsim/registry/test_multimem_port_ordering.py) | `test_full_kernel_defaults_to_system_publication`: both schedules, direct/TMA epilogues, one/two-CTA variants, fixed/runtime rank, `.sys` arrivals/polls, and alias fences; `test_origin_ordering_requires_explicit_opt_in`: historical signaling is explicit. |
+| [Full-kernel numerical tests](../../tests/numsim/runtime/test_full_multimem_gemm.py) | `test_full_gemm_all_reduce_matches_reference`: both schedules, direct/TMA epilogues, f32/bf16/f16 results, two/four ranks, independent float64 reference, and reset flags. |
+| [Full-kernel Racecheck tests](../../tests/analysis_tools/racecheck/test_native_full_multimem_gemm.py) | `test_full_gemm_system_publication_is_clean`: system-scope release/acquire and alias bridges; `test_full_gemm_origin_signaling_leaves_cross_rank_conflicts`: the original signaling remains a counterexample in the same kernel. |
+| [Full-kernel Synccheck tests](../../tests/analysis_tools/synccheck/test_native_full_multimem_gemm.py) | `test_full_gemm_pipeline_and_system_flag_waits_complete`: the actual port's pipeline barriers and cross-rank flag waits. |
+| [Benchmark evidence tests](../../tests/test_multigpu_benchmarks.py) | Historical signaling results cannot validate the corrected kernel; missing shapes/origins, wrong output, invalid timing, and performance below 99% fail the comparison. |
+
 `tests/numsim/support/runtime_cases.py` registers these tests as the runtime
 cases of the new ops, which `test_operation_runtime_cases.py` requires.
 
@@ -492,15 +504,17 @@ not corruption the tests observed.
 
 ## Ported kernels and parity with their origins
 
-Two TIRx kernels port production NVLS kernels, and both run as fast as their
-origins on 4× GB200. The one-shot all-reduce and the litmus kernels have no
-origin kernel, so they are not benchmarked.
+Two TIRx kernels port production NVLS kernels. The recorded origin-ordering
+versions meet the historical parity bar on 4× GB200. The full-scale GEMM's
+system-ordered default needs fresh correctness and performance validation;
+the old measurements do not validate that change. The one-shot all-reduce and
+litmus kernels have no origin kernel, so they are not benchmarked.
 
 | TIRx kernel | Origin |
 |---|---|
-| `multimem_kernels.two_shot_all_reduce` | CUTLASS CuTeDSL `examples/python/CuTeDSL/cute/blackwell/kernel/distributed/all_reduce_two_shot_multimem.py` |
-| `multimem_gemm_all_reduce.gemm_all_reduce`, `protocol="cutlass"` | CUTLASS CuTeDSL `.../distributed/distributed_gemm_all_reduce_blackwell.py`, `Sm100PersistentDenseGemmAllReduceLDMCxSTMCKernel` |
-| `multimem_gemm_all_reduce.gemm_all_reduce`, `protocol="flashinfer"` | FlashInfer `flashinfer/cute_dsl/gemm_allreduce_two_shot.py`, `PersistentDenseGemmKernel` with `all_reduce="two_shot"` |
+| `ported.cutlass.sm100_all_reduce.two_shot_all_reduce` | CUTLASS CuTeDSL `examples/python/CuTeDSL/cute/blackwell/kernel/distributed/all_reduce_two_shot_multimem.py` |
+| `ported.cutlass.sm100_gemm_all_reduce.gemm_all_reduce`, `protocol="cutlass"` | CUTLASS CuTeDSL `.../distributed/distributed_gemm_all_reduce_blackwell.py`, `Sm100PersistentDenseGemmAllReduceLDMCxSTMCKernel` |
+| `ported.cutlass.sm100_gemm_all_reduce.gemm_all_reduce`, `protocol="flashinfer"` | FlashInfer `flashinfer/cute_dsl/gemm_allreduce_two_shot.py`, `PersistentDenseGemmKernel` with `all_reduce="two_shot"` |
 
 The benchmarked two-shot all-reduce is the same prim_func the NumSim and
 checker tests run. It keeps the origin's structure: one 128-thread CTA per
@@ -520,9 +534,18 @@ It derives stage counts, the epilogue subtile, TMEM columns and the
 all-reduce warp count with the origins' formulas. A configuration therefore
 yields the same schedule as the origin built with it.
 
-The checker tests run `multimem_kernels.gemm_all_reduce_two_shot` instead (POC
-kernels above). It is a NumSim-sized model with the same warp roles and
-signalling.
+`protocol` chooses the origin's schedule and in-place/out-of-place data
+placement. Both default to `ordering="sys_fenced"`: complete the epilogue's
+stores, bridge the alias before a `.sys` release, then acquire at `.sys` and
+bridge the alias before the all-reduce reads. `ordering="origin"` keeps the
+GPU-scoped/relaxed signaling only for counterexamples and historical
+comparisons. It is not the benchmark default.
+
+The full-kernel tests call this same builder with `rank=None`, making rank a
+runtime scalar, and bind its unicast `out` for result inspection. The smaller
+`multimem_kernels.gemm_all_reduce_two_shot` remains the focused rule litmus.
+NumSim binding/reference code stays in `tests/numsim/support/`; neither port
+imports the harness or its tests.
 
 ### Where the ports differ from the origins
 
@@ -557,17 +580,23 @@ python -m benchmarks.multimem.two_shot_all_reduce \
 # results/gemm_all_reduce_tuning.jsonl.
 python -m benchmarks.multimem.gemm_all_reduce tune
 # TIRx against each origin's 3 fastest configurations; appends to
-# results/gemm_all_reduce_gb200x4.jsonl (a configuration's latest row counts)
+# results/gemm_all_reduce_sys_fenced.jsonl
 # and prints the table.
 python -m benchmarks.multimem.gemm_all_reduce compare
 # An independent repeat of the comparison.
 python -m benchmarks.multimem.gemm_all_reduce compare \
-  --out benchmarks/multimem/results/gemm_all_reduce_gb200x4_repeat.jsonl
+  --out benchmarks/multimem/results/gemm_all_reduce_sys_fenced_repeat.jsonl
 # The power-history check (notes under Results): idle 0.5 s before every sample.
 python -m benchmarks.multimem.gemm_all_reduce compare --idle-s 0.5 \
   --shapes cutlass_doc llama70b_down_m8192 llama70b_o_m8192 llama8b_o_m2048 \
-  --out benchmarks/multimem/results/gemm_all_reduce_gb200x4_idle.jsonl
+  --out benchmarks/multimem/results/gemm_all_reduce_sys_fenced_idle.jsonl
 ```
+
+Each new comparison records `tirx_ordering="sys_fenced"`. Its success gate
+uses only measurements from that invocation, requires every requested
+shape/origin pair, and rejects numerical failures or a latency ratio above
+`1 / 0.99`. Historical rows without the ordering field describe the origin
+protocol; `summarize(rows, ordering="origin")` can inspect them explicitly.
 
 **Timing** (`common.time_launches`). TIRx and the origin run in the same rank
 processes and on the same symmetric-memory buffers:
@@ -603,8 +632,8 @@ shape:
 
 `compare` builds TIRx from each of the origin's 3 fastest configurations and
 times it interleaved with the origin. It reports the origin's best time
-against TIRx's best. The parity bar is TIRx ≤ 1.01× the origin on every
-shape.
+against TIRx's best. The parity bar is TIRx latency ≤ `1 / 0.99` times the
+origin latency on every shape (at least 99% of the origin's performance).
 
 **Shapes.**
 
@@ -617,7 +646,9 @@ The shape lists live in `two_shot_all_reduce.py` and `gemm_all_reduce.py`.
 
 ### Results
 
-Every shape meets the bar. The worst ratios are 1.003 for the two-shot
+These are historical origin-ordering measurements, not measurements of the
+new system-ordered default. Every recorded shape meets the bar. The worst
+ratios are 1.003 for the two-shot
 all-reduce and 1.008 for the GEMM + all-reduce. Every compared configuration
 passed its correctness check, and every TIRx GEMM + all-reduce output equals
 its origin's bit for bit.
@@ -780,6 +811,12 @@ python -m pytest -q -n 16 \
   tests/analysis_tools/synccheck/test_native_multimem.py \
   tests/analysis_tools/synccheck/test_native_multimem_kernels.py \
   tests/analysis_tools/synccheck/test_native_multimem_ordering_rules.py
+
+python -m pytest -q -n 16 --dist=worksteal \
+  tests/numsim/runtime/test_full_multimem_gemm.py \
+  tests/analysis_tools/racecheck/test_native_full_multimem_gemm.py \
+  tests/analysis_tools/synccheck/test_native_full_multimem_gemm.py \
+  tests/test_multigpu_benchmarks.py
 
 # Live GPU comparison; -n 1 keeps multi-GPU launches from sharing devices.
 python -m pytest -q -n 1 tests/numsim/microtests/test_multimem.py

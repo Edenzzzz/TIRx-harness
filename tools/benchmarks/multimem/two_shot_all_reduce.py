@@ -27,7 +27,7 @@ LAUNCHES = 100
 def _tirx_launcher(rank: int, world: int, shape, workspace):
     import tvm
 
-    from tests.numsim.support.multimem_kernels import TILE, two_shot_all_reduce
+    from ported.cutlass.sm100_all_reduce import TILE, two_shot_all_reduce
 
     func = two_shot_all_reduce(shape[0] // TILE, world, shape[1] // TILE)
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
@@ -64,7 +64,7 @@ def rank_main(rank: int, world: int, shapes: list[list[int]]) -> list[dict]:
     import torch.distributed as dist
 
     from benchmarks.multimem import origins
-    from tests.numsim.support.multimem_kernels import TILE
+    from ported.cutlass.sm100_all_reduce import TILE
 
     device = torch.device("cuda", rank)
     rows = []

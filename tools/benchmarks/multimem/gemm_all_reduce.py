@@ -2,7 +2,7 @@
 ``distributed_gemm_all_reduce_blackwell.py`` (LDMCxSTMC) and FlashInfer's
 ``cute_dsl/gemm_allreduce_two_shot.py``, on the same symmetric buffers.
 
-    python -m benchmarks.multimem.gemm_all_reduce tune [--origins cutlass flashinfer] [--shapes NAME ...]
+    python -m benchmarks.multimem.gemm_all_reduce tune [--origins ORIGIN ...] [--shapes NAME ...]
     python -m benchmarks.multimem.gemm_all_reduce compare [--shapes NAME ...]
 
 ``tune`` times every configuration each origin accepts on every shape and
@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import faulthandler
 import json
+import math
 from pathlib import Path
 import time
 import traceback
@@ -184,13 +185,13 @@ def rounding_error(output, reference):
 def tirx_launchers(rank: int, world: int, shape: dict, config: dict, protocol: str,
                    workspace: list[dict], shared: dict):
     """One launch closure per workspace of TIRx ``gemm_all_reduce`` built with
-    ``config`` and the ``protocol`` (and data placement) of that origin."""
+    ``config`` and data placement of that origin, with system-scope ordering."""
 
     import torch
     from tirx_kernels.runner import compile_kernel
 
     from benchmarks.multimem import origins
-    from tests.numsim.support.multimem_gemm_all_reduce import gemm_all_reduce
+    from ported.cutlass.sm100_gemm_all_reduce import gemm_all_reduce
 
     cluster = config["cluster"]
     kernel = gemm_all_reduce(
@@ -205,7 +206,7 @@ def tirx_launchers(rank: int, world: int, shape: dict, config: dict, protocol: s
     def as_bytes(tensor):
         return tensor.view(torch.uint8).reshape(-1)
 
-    fixed = [as_bytes(shared[name]) for name in ("c", "c_mc", "out_mc")]
+    fixed = [as_bytes(shared[name]) for name in ("c", "out", "c_mc", "out_mc")]
     fixed += [shared["flag"], shared["flag_mc"]]
 
     def launcher(ws):
@@ -407,6 +408,7 @@ def compare_rank(rank: int, world: int, shape_name: str, entries: list[dict],
                             dtype=torch.int32)
         dist.all_reduce(same, op=dist.ReduceOp.MIN)
         row = {"shape": shape_name, "origin": origin, "config": config_key(config),
+               "tirx_ordering": "sys_fenced",
                "origin_error": errors["origin"], "tirx_error": errors["tirx"],
                "bitwise_equal": bool(int(same))}
         if errors["origin"] is None and errors["tirx"] is None:
@@ -422,11 +424,13 @@ def compare_rank(rank: int, world: int, shape_name: str, entries: list[dict],
     return rows
 
 
-def summarize(rows: list[dict]) -> list[dict]:
+def summarize(rows: list[dict], *, ordering: str = "sys_fenced") -> list[dict]:
     """Per shape and origin: the origin's best time over its configurations
     against TIRx's best over the same configurations. A configuration's latest
-    row replaces its earlier ones."""
+    row replaces its earlier ones. Legacy rows have origin ordering and are
+    excluded from the system-ordered result unless explicitly requested."""
 
+    rows = [row for row in rows if row.get("tirx_ordering", "origin") == ordering]
     rows = list({(r["shape"], r["origin"], r["config"]): r for r in rows}.values())
     summary = []
     for shape in SHAPES:
@@ -449,9 +453,31 @@ def summarize(rows: list[dict]) -> list[dict]:
     return summary
 
 
+def validate_summary(summary: list[dict], shapes: list[str], origins: list[str]) -> None:
+    """Require a correct, complete comparison with at least 99% performance."""
+    expected = {(shape, origin) for shape in shapes for origin in origins}
+    if not expected:
+        raise RuntimeError("GEMM/all-reduce validation requires shapes and origins")
+    observed = {(row["shape"], row["origin"]) for row in summary}
+    failures = [f"missing {shape}/{origin}" for shape, origin in sorted(expected - observed)]
+    for row in summary:
+        if (row["shape"], row["origin"]) not in expected:
+            continue
+        name = f"{row['shape']}/{row['origin']}"
+        if not row["correct"] or not row["bitwise_equal"]:
+            failures.append(f"{name}: numerical comparison failed")
+            continue
+        ratio = row.get("ratio", math.inf)
+        if not math.isfinite(ratio) or ratio <= 0 or ratio > 1 / 0.99:
+            failures.append(f"{name}: latency ratio {ratio:g} does not meet 99% parity")
+    if failures:
+        raise RuntimeError("GEMM/all-reduce validation failed: " + "; ".join(failures))
+
+
 def compare(origins_: list[str], shapes: list[str], world: int, log: Path, out: Path,
             top: int, idle_s: float = 0.0) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
+    completed_rows = []
     for shape_name in shapes:
         entries = [{"origin": origin, "config": config} for origin in origins_
                    for config in best_configs(log, origin, shape_name, top)]
@@ -460,10 +486,11 @@ def compare(origins_: list[str], shapes: list[str], world: int, log: Path, out: 
             continue
         rows = common.spawn("benchmarks.multimem.gemm_all_reduce:compare_rank", world,
                             shape_name, entries, idle_s)
+        completed_rows.extend(rows)
         with open(out, "a") as f:
             for row in rows:
                 f.write(json.dumps({**row, "time": round(time.time(), 1)}) + "\n")
-    summary = summarize(_log_lines(out))
+    summary = summarize(completed_rows)
     print(common.table([r for r in summary if "ratio" in r], [
         ("shape", "shape", "s"), ("types", "types", "s"), ("origin", "origin", "s"),
         ("origin_us", "origin (us)", ".2f"), ("tirx_us", "TIRx (us)", ".2f"),
@@ -472,6 +499,7 @@ def compare(origins_: list[str], shapes: list[str], world: int, log: Path, out: 
         if not row["correct"] or not row["bitwise_equal"]:
             print(f"[compare] {row['shape']} {row['origin']}: correct={row['correct']} "
                   f"bitwise_equal={row['bitwise_equal']}")
+    validate_summary(summary, shapes, origins_)
 
 
 def main() -> None:
@@ -485,7 +513,7 @@ def main() -> None:
         mode.add_argument("--log", type=Path, default=RESULTS / "gemm_all_reduce_tuning.jsonl")
     sub.choices["compare"].add_argument("--top", type=int, default=TOP)
     sub.choices["compare"].add_argument(
-        "--out", type=Path, default=RESULTS / "gemm_all_reduce_gb200x4.jsonl")
+        "--out", type=Path, default=RESULTS / "gemm_all_reduce_sys_fenced.jsonl")
     sub.choices["compare"].add_argument("--idle-s", type=float, default=0.0)
     args = parser.parse_args()
     if args.mode == "tune":

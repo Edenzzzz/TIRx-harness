@@ -30,6 +30,14 @@ kernel or hardware cause is established. No new performance-equivalence
 measurements completed. Continue the GPU checks under the shared socket lease
 when an active worker is available; preserve the same kernel implementation.
 
+The subsequent full-scale publication correction passes **29 local tests**
+under Python 3.13.2, TVM 0.27.0.post1, and TIRx-kernels 0.1.2.post1:
+19 IR contract tests cover system-scope arrivals/polls, alias fences,
+one/two-CTA builds, fixed/runtime rank, and explicit origin-ordering opt-in;
+10 benchmark-evidence tests reject stale/missing/incorrect or slow results.
+These do not execute the kernel's memory effects. The new full-kernel
+NumSim/Racecheck/Synccheck tests and GPU comparisons remain unrun.
+
 Local handoff checks passed for all 52 changed Python files' syntax, one JSON
 result file and 11,950 JSONL records, 37 local documentation links, 32 named
 rule-to-test references, documentation code-block syntax, and patch whitespace.
@@ -63,13 +71,14 @@ are historical reports; they have not been reproduced on this branch.
 
 ## Correctness limits to resolve
 
-- **Full-scale GEMM + all-reduce is not proved race-free.** Its benchmarked
-  `cutlass` and `flashinfer` protocols retain the origins' GPU-scoped or
-  relaxed signaling. The checker counterexamples diagnose these protocols;
-  matching GPU output does not discharge those findings. The `sys_fenced`
-  clean variant is currently in the smaller checker kernel. Finish and check
-  an appropriately ordered full-scale variant, then measure that exact
-  variant against the origins across the complete shape matrix.
+- **Full-scale GEMM + all-reduce needs validation of the corrected default.**
+  The port now defaults to `ordering="sys_fenced"` for both origin schedules:
+  complete stores, system-scope release/acquire, and alias fences on the
+  publication path. Its new direct NumSim/Racecheck/Synccheck tests have not
+  run yet and are not included in the 499-pass result. `ordering="origin"`
+  remains an explicit negative control. Run those tests, then measure the
+  corrected kernel across the complete shape matrix. Comparison rows now
+  record the ordering mode, and the gate cannot reuse old signaling results.
 - **Mega MoE is `review`, not `clean`.** Its test requires zero physical race
   findings and one `alias_stale_read` advisory. The
   [provenance explanation](MULTI_GPU_PEER.md#shared-pool-alias-advisory) describes
@@ -81,11 +90,11 @@ are historical reports; they have not been reproduced on this branch.
   paths must stay consistent. The numerical model has GB200-specific floating
   reduction behavior, with one-ulp tolerance for half sums. A green test set
   is not a claim to cover arbitrary PTX forms, inputs, or GPU architectures.
-- **Representative kernels are not identical coverage.** Two-shot uses the
-  benchmarked kernel in checker tests. Full-scale multimem GEMM currently uses
-  a separate small model for those tests. The two peer ports live in
-  `ported/`; the multimem ports are still in `tests/numsim/support/`. Keep
-  those distinctions explicit when finishing the example-kernel handoff.
+- **Full-kernel test execution is still pending.** The multimem ports now live
+  in `ported/cutlass/`; tests own only bindings, references, and focused rule
+  kernels. Two-shot retains its existing checker coverage. The new full-scale
+  GEMM tests complement the small model, but adding them does not establish
+  their result or replace the final GPU validation.
 
 ## Resume gates
 
