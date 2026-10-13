@@ -53,6 +53,14 @@ epilogues, uneven work counts, and an alias-fence removal negative control.
 These tests run the committed kernel builder, not a GPU-only optimization
 prototype, and do not establish performance parity.
 
+A broader Linux Python run stopped after 564 passing cases because a worker's
+memory use kept growing; this is not a full-suite pass. Isolated, identical
+reruns of
+`test_mega_moe_expert_parallel_has_no_stale_pool_alias_advisory` exceeded a
+12 GiB resident-memory limit in both the current tree and `13eeeca`. The
+complete Mega MoE analysis therefore remains unvalidated, rather than being
+classified as a passing test or a new release-RMW regression.
+
 The subsequent engine checks reproduced and corrected acceptance of invalid
 multimem specializations and stale provenance after unnamed writes. The nine
 multimem Rust tests pass. The complete Rust suite on macOS reports 770 passing
@@ -82,6 +90,22 @@ implementation. Preserve the original comparison kernels and the 99% threshold;
 neither historical `origin` ordering nor a faster unchecked prototype closes
 this gate. Every accepted timing must use only the GPUs actually assigned by
 the socket lease; an override of that assignment invalidates the run.
+
+On October 13, a fresh four-rank GPU screen covered **all 19 declared shapes
+against both pinned origins: 38 shape/origin comparisons**, with one retained
+top configuration per pair. The unchanged committed `sys_fenced` builder
+matched each origin bitwise on every rank, satisfied the independent float64
+reference's output-rounding tolerance, and reset every flag. The kernel source
+SHA-256 was
+`362e524feadef94cb9546a92caef4a49b0b6ecbfae5e52b28d985b4d257b21f0`;
+the run used Python 3.13.15 and NVRTC 13.4.92 under the shared socket lease.
+This expands numerical evidence, **not** the performance claim: its triage
+timings used 20 graph launches, 3 interleaved trials, a 10 ms target, and 0.1 s
+idle, rather than the final comparison's 100 launches, 9 trials, and top-three
+configuration selection. The full performance gate and independent repeat
+remain open. A separately screened optimization prototype also matched the
+outputs, but its scoped alias fences are not yet modeled by NumSim; it is
+neither the committed implementation nor checker-validated evidence.
 
 The pushed benchmark preflight was then run in the supported Linux environment
 with Python 3.13.16, TVM 0.27.0.post1, TIRx-kernels 0.1.2.post1, and Rust 1.99:
