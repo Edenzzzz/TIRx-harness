@@ -10,8 +10,9 @@ the TMA-store or direct-store epilogue) and derived parameters (stage counts,
 epilogue subtile, TMEM columns), computed with CUTLASS's formulas.
 
 CUTLASS launches one GEMM per rank's shard, each remote one gated on a flag
-its copy stream releases after pulling the shard. This port covers every shard
-in one persistent launch, as FlashInfer's cake all-gather matmul does: the
+its copy stream releases after pulling the shard. ``cutlass_gemm`` preserves
+that single-shard kernel and its optional entry gate. ``all_gather_gemm`` is
+a separate fused example, not faithful-port performance evidence: its
 scheduler walks this rank's shard first and then rank ``rank + j``'s at step
 ``j``, each in ``chunk_rows``-row chunks, and the TMA warp acquires a remote
 chunk's flag (``ld.acquire.sys``, then ``fence.proxy.async.global`` for its
@@ -37,6 +38,7 @@ import inspect
 from dataclasses import dataclass
 
 import tirx_kernels.tirx_lite as txl
+from tvm.script import tirx as T
 
 SMEM_CAPACITY = 232_448
 AB_BYTES = {"tf32": 4, "f16": 2, "bf16": 2}
@@ -63,6 +65,7 @@ class Plan:
     use_tma_store: bool
     chunk_rows: int
     max_active_clusters: int
+    allow_ragged: bool = False
 
     @property
     def cta_group(self):
@@ -107,6 +110,11 @@ class Plan:
     @property
     def cluster_tiles(self):
         """Cluster tiles (M, N) of one chunk."""
+        if self.allow_ragged:
+            cluster_rows = self.cta_m * self.cluster[0]
+            cluster_columns = self.cta_n * self.cluster[1]
+            return ((self.chunk_rows + cluster_rows - 1) // cluster_rows,
+                    (self.n + cluster_columns - 1) // cluster_columns)
         return (self.chunk_rows // (self.cta_m * self.cluster[0]),
                 self.n // (self.cta_n * self.cluster[1]))
 
@@ -187,16 +195,18 @@ class Plan:
 
 
 def plan(m, n, k, ab, c, world, *, use_2cta, mma_tiler, cluster, use_tma_store, raster="m",
-         swizzle=1, chunk_rows=None, max_active_clusters):
+         swizzle=1, chunk_rows=None, max_active_clusters, allow_ragged=False):
     """The schedule of one configuration; ``chunk_rows`` defaults to the whole shard."""
 
     p = Plan(m, n, k, ab, c, world, use_2cta, tuple(mma_tiler), tuple(cluster), raster, swizzle,
-             use_tma_store, chunk_rows or m, max_active_clusters)
+             use_tma_store, chunk_rows or m, max_active_clusters, allow_ragged)
     if p.cta_m not in (64, 128) or p.cta_n % 32 or p.cluster[0] % p.cta_group:
         raise ValueError(f"unsupported MMA tile / cluster {p.mma_tiler} {p.cluster}")
-    if p.m % p.chunk_rows or p.chunk_rows % (p.cta_m * p.cluster[0]):
+    if allow_ragged and not use_tma_store:
+        raise ValueError("ragged tiles require the baseline TMA-store epilogue")
+    if p.m % p.chunk_rows or (not allow_ragged and p.chunk_rows % (p.cta_m * p.cluster[0])):
         raise ValueError("a chunk must be a whole number of cluster tiles and divide the shard")
-    if p.n % (p.cta_n * p.cluster[1]) or p.k % p.k_tile:
+    if (not allow_ragged and p.n % (p.cta_n * p.cluster[1])) or p.k % p.k_tile:
         raise ValueError("N must be a whole number of cluster tiles and K of K tiles")
     if swizzle > 1 and p.cluster_tiles[1 if raster == "m" else 0] % swizzle:
         raise ValueError("the swizzle must divide the swizzled cluster count")
@@ -259,6 +269,55 @@ def _peer(pointer, offset):
 
 
 @functools.cache
+def sync_nvl_devices(world):
+    """The baseline's one-thread flag reset and relaxed system-scope rendezvous.
+
+    counter retains the local allocation in the binding contract; accesses use
+    the same absolute peer-address table as the CUTLASS kernel.
+    """
+    @T.prim_func
+    def sync(
+        rank: T.int32,
+        addresses: T.Buffer((world,), "int64"),
+        flags: T.Buffer((world,), "int32"),
+        counter: T.Buffer((1,), "int32"),
+    ):
+        T.device_entry()
+        T.cta_id([1])
+        T.thread_id([1])
+        previous = T.alloc_local((1,), "int32")
+        seen = T.alloc_local((1,), "int32")
+        for index in T.serial(world):
+            flags[index] = 0
+        for peer in T.serial(world):
+            if peer != rank:
+                T.ptx.atom.relaxed.sys.global_.add.s32(
+                    previous[0], T.reinterpret("handle", T.Cast("uint64", addresses[peer])), T.int32(1))
+        T.ptx.ld.relaxed.sys.global_.b32(
+            seen[0], T.reinterpret("handle", T.Cast("uint64", addresses[rank])))
+        while seen[0] < world - 1:
+            T.ptx.ld.relaxed.sys.global_.b32(
+                seen[0], T.reinterpret("handle", T.Cast("uint64", addresses[rank])))
+        T.ptx.atom.relaxed.sys.global_.add.s32(
+            previous[0], T.reinterpret("handle", T.Cast("uint64", addresses[rank])), T.int32(1 - world))
+
+    return sync
+
+
+@functools.cache
+def release_flag(world):
+    """The baseline's one-thread ReleaseFlagSet, with a runtime step index."""
+    @T.prim_func
+    def release(flags: T.Buffer((world,), "int32"), step: T.int32):
+        T.device_entry()
+        T.cta_id([1])
+        T.thread_id([1])
+        T.ptx.red.release.sys.global_.add.s32(flags.ptr_to([step]), T.int32(1))
+
+    return release
+
+
+@functools.cache
 def barrier_kernel(rank, world, flag_len):
     """CUTLASS's ``SyncNvlDevices`` with release/acquire ordering: one thread
     clears ``flags``, adds one to every peer's ``counter`` (``red.release.sys``,
@@ -295,9 +354,25 @@ def barrier_kernel(rank, world, flag_len):
 
 
 @functools.cache
+def cutlass_gemm(m, n, k, ab, c, *, use_2cta, mma_tiler, cluster, use_tma_store,
+                 max_active_clusters, gated_a_load=False):
+    """The baseline's single-shard persistent GEMM, optionally gated on flags[0].
+
+    The host launches one instance per shard, with the original copy/release
+    schedule. Parameters are a, scratch, b, out, flags; scratch is unused and
+    may be the same view as a. No copy warps or fused shard scheduling are used.
+    """
+    return all_gather_gemm(
+        m, n, k, ab, c, 0, 1, use_2cta=use_2cta, mma_tiler=mma_tiler,
+        cluster=cluster, use_tma_store=use_tma_store,
+        max_active_clusters=max_active_clusters, gated_a_load=gated_a_load,
+    )
+
+
+@functools.cache
 def all_gather_gemm(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster,
                     use_tma_store, raster="m", swizzle=1, chunk_rows=None,
-                    max_active_clusters, copy_warps=0):
+                    max_active_clusters, copy_warps=0, gated_a_load=None):
     """Build rank ``rank``'s GEMM; returns a ``txl.Kernel`` with parameters
     ``a, scratch, b, out, flags`` (see the module docstring).
 
@@ -315,9 +390,12 @@ def all_gather_gemm(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
     ``flags``, so every rank runs one kernel, as a NumSim multi-rank launch
     needs."""
 
+    single_shard = gated_a_load is not None
+    if single_shard and (world != 1 or rank != 0 or copy_warps or chunk_rows not in (None, m)):
+        raise ValueError("the faithful GEMM entry processes one shard without a copy role")
     p = plan(m, n, k, ab, c, world, use_2cta=use_2cta, mma_tiler=mma_tiler, cluster=cluster,
              use_tma_store=use_tma_store, raster=raster, swizzle=swizzle, chunk_rows=chunk_rows,
-             max_active_clusters=max_active_clusters)
+             max_active_clusters=max_active_clusters, allow_ragged=single_shard and use_tma_store)
     g, cta_m, cta_n = p.cta_group, p.cta_m, p.cta_n
     cm, cn = p.cluster
     ncm, ncn = p.cluster_tiles
@@ -365,7 +443,7 @@ def all_gather_gemm(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
 
     def host_prelude(params):
         a_map = txl.stack_alloca("tensormap", 1)
-        s_map = txl.stack_alloca("tensormap", 1)
+        s_map = txl.stack_alloca("tensormap", 1) if not single_shard else None
         b_map = txl.stack_alloca("tensormap", 1)
         c_map = txl.stack_alloca("tensormap", 1) if use_tma_store else None
 
@@ -376,8 +454,9 @@ def all_gather_gemm(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
                             box_inner, box_outer, 1, 1, 1, 1, 0, swizzle_mode, 2, 0)
 
         encode(a_map, STORAGE[ab], params["a"].data, k, m, p.k_tile, a_piece, 3, abb)
-        encode(s_map, STORAGE[ab], params["scratch"].data, k, world * m, p.k_tile, a_piece, 3,
-               abb)
+        if not single_shard:
+            encode(s_map, STORAGE[ab], params["scratch"].data, k, world * m, p.k_tile, a_piece, 3,
+                   abb)
         encode(b_map, STORAGE[ab], params["b"].data, k, n, p.k_tile, b_piece, 3, abb)
         if use_tma_store:
             encode(c_map, STORAGE[c], params["out"].data, n, world * m, block_cols, block_rows,
@@ -427,7 +506,8 @@ def all_gather_gemm(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
 
         with tma_role:
             txl.ptx.prefetch.tensormap(txl.address_of(a_map))
-            txl.ptx.prefetch.tensormap(txl.address_of(s_map))
+            if not single_shard:
+                txl.ptx.prefetch.tensormap(txl.address_of(s_map))
             txl.ptx.prefetch.tensormap(txl.address_of(b_map))
             if use_tma_store:
                 txl.ptx.prefetch.tensormap(txl.address_of(c_map))
@@ -486,10 +566,13 @@ def all_gather_gemm(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
             """(step, chunk, CTA tile m within the shard, CTA tile n) of a cluster
             work index: steps, then chunks, then ``StaticPersistentTileScheduler``'s
             order over the chunk's cluster tiles."""
-            step = work // p.shard_work
-            rest = work % p.shard_work
-            chunk = rest // p.chunk_work
-            w = rest % p.chunk_work
+            if single_shard:
+                step, chunk, w = 0, 0, work
+            else:
+                step = work // p.shard_work
+                rest = work % p.shard_work
+                chunk = rest // p.chunk_work
+                w = rest % p.chunk_work
             s = swizzle
             if s == 1 and raster == "m":
                 cl_m, cl_n = w % ncm, w // ncm
@@ -504,6 +587,8 @@ def all_gather_gemm(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
             return step, chunk, (chunk * ncm + cl_m) * cm + cluster_x, cl_n * cn + cluster_y
 
         def shard_of(step):
+            if single_shard:
+                return 0
             return (step + this_rank) % world
 
         def next_work(work):
@@ -545,17 +630,24 @@ def all_gather_gemm(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
             count = txl.local_scalar("int32")
             ready = txl.local_scalar("uint32")
             seen = txl.local_scalar("uint32")
+            if gated_a_load:
+                with txl.If(lane == 0), txl.Then():
+                    txl.cuda.wait_until(seen, flags.ptr_to([0]),
+                                        lambda value: value != txl.uint32(0),
+                                        scope="sys", ptx_type="u32")
+                txl.cuda.warp_sync()
             # As in the MMA warp, one elected thread runs the whole load stream.
             with txl.If(_elected()), txl.Then():
                 with txl.While(work < p.cluster_work):
                     step, chunk, tile_m, tile_n = tile_of(work)
                     shard = shard_of(step)
                     remote = step != txl.int32(0)
-                    with txl.If(remote), txl.Then():
-                        txl.cuda.wait_until(seen, flags.ptr_to([shard * p.chunks + chunk]),
-                                            lambda value: value != txl.uint32(0),
-                                            scope="sys", ptx_type="u32")
-                        txl.ptx.fence.proxy.async_.global_()
+                    if not single_shard:
+                        with txl.If(remote), txl.Then():
+                            txl.cuda.wait_until(seen, flags.ptr_to([shard * p.chunks + chunk]),
+                                                lambda value: value != txl.uint32(0),
+                                                scope="sys", ptx_type="u32")
+                            txl.ptx.fence.proxy.async_.global_()
                     txl.assign(count, 0)
                     txl.assign(ready, txl.uint32(1))
                     _try_wait(ready, ab_pipe.empty.ptr_to([state.stage]), state.phase)
@@ -566,10 +658,12 @@ def all_gather_gemm(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
                                 ab_pipe.full.ptr_to([state.stage]), txl.uint32(tma_bytes))
                         a_row = tile_m * cta_m + cluster_y * a_piece
                         loads = (
-                            (lambda: txl.Select(remote, txl.address_of(s_map),
-                                                txl.address_of(a_map)),
+                            ((lambda: txl.address_of(a_map)) if single_shard else
+                             (lambda: txl.Select(remote, txl.address_of(s_map),
+                                                 txl.address_of(a_map))),
                              a_offset + state.stage * p.a_stage_bytes + cluster_y * a_piece_bytes,
-                             txl.Select(remote, shard * m + a_row, a_row), a_mask, cn),
+                             a_row if single_shard else txl.Select(remote, shard * m + a_row, a_row),
+                             a_mask, cn),
                             (lambda: txl.address_of(b_map),
                              b_offset + state.stage * p.b_stage_bytes
                              + cluster_m_group * b_piece_bytes,
@@ -789,19 +883,24 @@ def all_gather_gemm(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
                         stores_when_active(stage_chunks)
                         txl.ptx.fence.proxy.async_.shared__cta()
                         txl.ptx.bar.sync(txl.uint32(1), txl.uint32(128))
-                        with txl.If((warp == 0) & (lane == 0)), txl.Then():
-                            for block in range(blocks):
-                                if layout == "split_n":
-                                    col = tile_n * cta_n + block * (cta_n // 2) + subtile * 32
-                                else:
-                                    col = tile_n * cta_n + subtile * sub_cols + block * block_cols
-                                txl.ptx["cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"](
-                                    txl.address_of(c_map), txl.cast(col, "int32"),
-                                    txl.cast(tile_row, "int32"), txl.int32(0),
-                                    smem.ptr_to([c_offset + c_buffer * p.c_stage_bytes
-                                                 + block * block_bytes]))
-                            txl.ptx.cp.async_.bulk.commit_group()
-                            txl.ptx.cp.async_.bulk.wait_group.read(c_stages - 1)
+                        with txl.If(warp == 0), txl.Then():
+                            with txl.If(_elected() if single_shard else (lane == 0)), txl.Then():
+                                for block in range(blocks):
+                                    if layout == "split_n":
+                                        col = tile_n * cta_n + block * (cta_n // 2) + subtile * 32
+                                    else:
+                                        col = tile_n * cta_n + subtile * sub_cols + block * block_cols
+                                    txl.ptx["cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"](
+                                        txl.address_of(c_map), txl.cast(col, "int32"),
+                                        txl.cast(tile_row, "int32"), txl.int32(0),
+                                        smem.ptr_to([c_offset + c_buffer * p.c_stage_bytes
+                                                     + block * block_bytes]))
+                                if not single_shard:
+                                    txl.ptx.cp.async_.bulk.commit_group()
+                                    txl.ptx.cp.async_.bulk.wait_group.read(c_stages - 1)
+                            if single_shard:
+                                txl.ptx.cp.async_.bulk.commit_group()
+                                txl.ptx.cp.async_.bulk.wait_group.read(c_stages - 1)
                         txl.ptx.bar.sync(txl.uint32(1), txl.uint32(128))
                         txl.assign(c_buffer, c_buffer + 1)
                         with txl.If(c_buffer == c_stages), txl.Then():
@@ -827,8 +926,11 @@ def all_gather_gemm(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
                 next_work(work)
 
             if use_tma_store:
-                with txl.If((warp == 0) & (lane == 0)), txl.Then():
-                    txl.ptx.cp.async_.bulk.wait_group(0)
+                if single_shard:
+                    txl.ptx.cp.async_.bulk.wait_group.read(0)
+                else:
+                    with txl.If((warp == 0) & (lane == 0)), txl.Then():
+                        txl.ptx.cp.async_.bulk.wait_group(0)
             with txl.If(warp == 0), txl.Then():
                 txl.ptx[f"tcgen05.relinquish_alloc_permit.cta_group::{g}.sync.aligned"]()
             txl.ptx.bar.sync(txl.uint32(1), txl.uint32(128))

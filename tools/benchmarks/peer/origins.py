@@ -96,7 +96,7 @@ def _stream(stream: torch.cuda.Stream):
 
 
 def cutlass_launchers(rank: int, world: int, shape: dict, config: dict,
-                      workspace: list[dict], shared: dict):
+                      workspace: list[dict], shared: dict, *, implementation: str = "cutlass"):
     """CUTLASS's graph body per workspace: ``SyncNvlDevices`` (which also clears
     the step flags), then on a GEMM stream one persistent GEMM per rank's shard,
     local first, each remote one gated on its step flag, while a copy stream
@@ -108,6 +108,8 @@ def cutlass_launchers(rank: int, world: int, shape: dict, config: dict,
     counter (one int32).
     """
 
+    if implementation not in ("cutlass", "tirx"):
+        raise ValueError(f"unknown CUTLASS schedule implementation {implementation!r}")
     ab, c = AB_TYPES[shape["ab"]], C_TYPES[shape["c"]]
     m, n, k = shape["m"], shape["n"], shape["k"]
     tiler, cluster = tuple(config["mma_tiler"]), tuple(config["cluster"])
@@ -132,47 +134,61 @@ def cutlass_launchers(rank: int, world: int, shape: dict, config: dict,
     clusters = max_active_clusters(cluster[0] * cluster[1])
     stream = _stream(torch.cuda.current_stream())
     # ``flag_offset`` is a Constexpr: one compiled GEMM per shard.
-    compiled = [cute.compile(kernels[p != rank], a0[p], b_views[0], c0[p], clusters, stream,
-                             flag_offset=p, gate_a_flags=gate) for p in range(world)]
-    arrival = torch.tensor(peer_pointers(shared["arrival"]), device="cuda", dtype=torch.int64)
-    arrival_view = from_dlpack(arrival)
-    sync = cute.compile(_cutlass_ag.SyncNvlDevices(world), device_idx=rank,
-                        device_arrival_counters=arrival_view, iteration_flags=gate,
-                        stream=stream)
-    release = cute.compile(_cutlass_ag.ReleaseFlagSet(), gate_a_flags=gate,
-                           step=cutlass.Int32(0), stream=stream)
-    # A compiled function loads its library on first call, and the load waits
-    # for the device to idle: loading a later step's GEMM while an earlier gated
-    # GEMM spins on its flag would deadlock. CUTLASS's example captures its
-    # graph before any launch; here every library is loaded up front.
-    for function in (*compiled, sync, release):
-        function.to(None)
+    if implementation == "cutlass":
+        compiled = [cute.compile(kernels[p != rank], a0[p], b_views[0], c0[p], clusters, stream,
+                                 flag_offset=p, gate_a_flags=gate) for p in range(world)]
+        arrival = torch.tensor(peer_pointers(shared["arrival"]), device="cuda", dtype=torch.int64)
+        arrival_view = from_dlpack(arrival)
+        sync = cute.compile(_cutlass_ag.SyncNvlDevices(world), device_idx=rank,
+                            device_arrival_counters=arrival_view, iteration_flags=gate,
+                            stream=stream)
+        release = cute.compile(_cutlass_ag.ReleaseFlagSet(), gate_a_flags=gate,
+                               step=cutlass.Int32(0), stream=stream)
+        for function in (*compiled, sync, release):
+            function.to(None)
+        all_sources = [a_views(values) for values in workspace]
+        all_destinations = [c_views(values) for values in workspace]
+
+        def launch_gemm(workspace_index, peer, target_stream):
+            compiled[peer](all_sources[workspace_index][peer], b_views[workspace_index],
+                           all_destinations[workspace_index][peer], _stream(target_stream),
+                           gate_a_flags=gate)
+
+        def launch_sync(target_stream):
+            sync(rank, arrival_view, gate, _stream(target_stream))
+
+        def launch_release(peer, target_stream):
+            release(gate, cutlass.Int32(peer), _stream(target_stream))
+    else:
+        from benchmarks.peer.fidelity import prepare_tirx
+
+        launch_gemm, launch_sync, launch_release = prepare_tirx(
+            rank, world, shape, config, workspace, shared)
     gemm_stream, copy_stream = torch.cuda.Stream(), torch.cuda.Stream()
     shard_bytes = m * k * workspace[0]["a"].element_size()
 
-    def launcher(ws, b_view):
-        a, cs = a_views(ws), c_views(ws)
+    def launcher(workspace_index, ws):
         sources = peer_pointers(ws["a"])
 
         def launch():
             main = torch.cuda.current_stream()
-            sync(rank, arrival_view, gate, _stream(main))
+            launch_sync(main)
             gemm_stream.wait_stream(main)
             for j in range(world):
                 p = (rank + j) % world
-                compiled[p](a[p], b_view, cs[p], _stream(gemm_stream), gate_a_flags=gate)
+                launch_gemm(workspace_index, p, gemm_stream)
             copy_stream.wait_stream(main)
             for j in range(1, world):
                 p = (rank + j) % world
                 driver.cuMemcpyDtoDAsync(shared["pulled"][p].data_ptr(), sources[p], shard_bytes,
                                          copy_stream.cuda_stream)
-                release(gate, cutlass.Int32(p), _stream(copy_stream))
+                launch_release(p, copy_stream)
             main.wait_stream(copy_stream)
             main.wait_stream(gemm_stream)
 
         return launch
 
-    return [launcher(ws, b_view) for ws, b_view in zip(workspace, b_views)], None
+    return [launcher(index, ws) for index, ws in enumerate(workspace)], None
 
 
 def cake_launchers(rank: int, world: int, shape: dict, workspace: list[dict]):

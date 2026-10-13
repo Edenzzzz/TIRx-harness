@@ -80,6 +80,26 @@ tests; its effect on the complete kernel still needs Linux validation.
 
 ## Related tests
 
+The baseline-faithful all-gather components have separate coverage:
+`tests/numsim/runtime/test_all_gather_fidelity.py` executes gated/ungated
+per-shard GEMM (including ragged tiles), the exact one-thread relaxed
+rendezvous with registered peer addresses, and release of one selected flag.
+`tests/numsim/registry/test_all_gather_fidelity.py` preserves their instruction
+and launch contracts. These numerical checks do not declare the original
+relaxed protocol race-free or simulate the host copy-engine schedule.
+
+`tests/numsim/registry/test_mega_moe_fidelity.py` checks the restored reference
+timeout/load forms and serial chunks within each token's warp. The numerical
+and ordering examples in `tests/numsim/support/peer_mega_moe.py` explicitly use
+`ordering="sys_fenced"`; pass `ordering="origin"` to construct the unstrengthened
+port instead. Neither IR assertions nor the historical strengthened timings
+establish current Mega MoE GPU parity.
+
+`tests/numsim/runtime/test_partial_cta.py` and the matching GPU microtests check
+exact thread counts, divergent scalar paths, and untouched absent lanes.
+The Racecheck/Synccheck `test_partial_cta.py` cases exercise those same launch
+masks; unsupported partial-CTA collectives are rejected, not called clean.
+
 `tests/numsim/support/peer_litmus.py` runs one warp per rank and takes scalar
 modes, so one transpile serves a rule's passing form and every counterexample:
 
@@ -262,13 +282,22 @@ finding. The advisory's stale writer name came from the following sequence:
 
 ### ABI
 
-`NUMSIM_ABI_VERSION` is 40 (`rank_mappings`), in both `numsim/abi.py` and
-`engine-rs/src/lib.rs`.
+`NUMSIM_ABI_VERSION` is 41, in both `numsim/abi.py` and
+`engine-rs/src/lib.rs`: version 40 added `rank_mappings`; version 41 adds exact
+CTA thread counts and partial-warp masks. The baseline's one-thread kernels
+are not padded to a warp to accommodate the simulator.
 
 ## Ported kernels
 
 Both ports stay in the harness for now (`ported/`), to be copied to
 [mlc-ai/tirx-kernels](https://github.com/mlc-ai/tirx-kernels) later.
+
+The default Mega MoE builder is the reference-ordering port. Its timeout paths,
+volatile polls, readonly top-k loads, TMEM deallocation, and per-token combine
+schedule are retained. `ordering="sys_fenced"` constructs a separate semantic
+example with additional ordering; it is not the performance baseline. The
+legacy differences and measurements below describe that earlier work, not
+permission to optimize the port beyond the reference.
 
 | Port | Origin | NumSim-sized version |
 |---|---|---|
@@ -307,6 +336,14 @@ peers through `symm_rank_offset_<p>` scalars over one `SymmetricBuffer`.
 `TIRX_DEEPGEMM_NUM_SMS_OVERRIDE` shrinks the grid for NumSim.
 
 ### Where the ports differ from the origins
+
+The differences below mean these implementations are not yet faithful-port
+performance evidence. The TIRx POC requires the baseline's instructions and
+schedule, not speedups from different work partitioning or synchronization.
+Preserve these historical diagnostics, but restore/audit the baseline path
+before claiming IR parity. In particular, removing timeout paths for checker
+convenience is not an acceptable final port, and the flattened combine split
+must not substitute for fixing overhead in DeepGEMM's original loop.
 
 Mega MoE:
 - **NVLink barrier:** DeepGEMM polls with `ld.acquire.sys` and traps after a
@@ -487,6 +524,26 @@ while signal == 0:
   the benchmark's wrapper on NaN-filled scratch all passed, and none hung.
 
 ## Benchmark method
+
+### Baseline-faithful all-gather
+
+`benchmarks.peer.fidelity` uses CUTLASS's per-shard GEMM launches, copy stream,
+one-thread rendezvous and release kernels, and stream joins for both sides.
+It substitutes TIRx kernels without fusing launches or redistributing work.
+Both use the same CUTLASS configurations; the summary compares them at the
+baseline's fastest configuration, not at a separately tuned TIRx configuration.
+Numerical equality is checked before 40-launch, 15-trial interleaved timing.
+Missing, incorrect, or slower-than-99% evidence fails the command.
+
+```bash
+python -m benchmarks.peer.fidelity --world 4 --log /path/to/all_gather_gemm_tuning.jsonl --out /tmp/all_gather_fidelity.jsonl
+python -m benchmarks.peer.fidelity --world 4 --log /path/to/all_gather_gemm_tuning.jsonl --out /tmp/all_gather_fidelity_repeat.jsonl
+```
+
+The tuning log supplies baseline configurations, not acceptance evidence.
+Keep raw measurement JSON outside Git. The legacy fused/chunked comparison
+and historical results below are cross-implementation experiments, not proof
+of faithful-port parity.
 
 All runs: 4x GB200 (sm_100a, 152 SMs), world size 4, torch 2.14.1+cu130,
 nvidia-cutlass-dsl 4.7.0.

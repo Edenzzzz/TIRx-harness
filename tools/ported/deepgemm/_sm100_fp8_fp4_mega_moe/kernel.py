@@ -45,7 +45,7 @@ __all__ = ["get_kernel"]
 
 
 def load_global_s64(dst, address):
-    return txl.ptx.ld.global_.s64(dst, address)
+    return txl.ptx.ld.global_.nc.s64(dst, address)
 
 
 def load_global_u64(dst, address):
@@ -68,18 +68,10 @@ def store_global_u8(address, value):
     return txl.ptx.st.global_.u8(address, value)
 
 
-# The NVLink barrier's signal word is declared the same way as the grid-sync
-# counter below. DeepGEMM polls it with `ld.acquire.sys` and traps after a
-# timeout; a wait that can time out is a loop the checker cannot see the exit
-# condition of, so this one has no timeout, like the grid sync.
 def wait_acq_sys_s32(dst, address, predicate):
     return txl.cuda.wait_until(dst, address, predicate, scope="sys", ptx_type="s32")
 
 
-# The grid-sync counter is a declared synchronization word: the wait below is
-# spelled `txl.cuda.wait_until`, which emits the loop the raw spelling did and
-# additionally tells the checker that this address carries a protocol, so the
-# accesses that reach it -- and only those -- belong to the barrier.
 def atomic_add_rel_u32(dst, address, value):
     return txl.ptx.atom.release.gpu.global_.add.u32(dst, address, value)
 
@@ -359,7 +351,12 @@ def get_kernel(
     activation_clamp: float = 10.0,
     fast_math: int = 1,
     collect_stats: bool = False,
+    ordering: str = "origin",
 ):
+    """Port the reference; sys_fenced is a separate strengthened analysis example."""
+    if ordering not in ("origin", "sys_fenced"):
+        raise ValueError(f"unsupported Mega MoE ordering: {ordering!r}")
+    strengthened = ordering == "sys_fenced"
     # ---- compile-time constants (all Python ints; nothing below is emitted) ----
     runtime_config = MegaMoeConfig(
         num_processes=num_processes,
@@ -1528,6 +1525,9 @@ def get_kernel(
         epilogue_wg_idx = txl.local_scalar("int32")
         grid_sync_old_value = txl.local_scalar("uint32")
         grid_sync_new_value = txl.local_scalar("uint32")
+        grid_sync_start_clock = txl.local_scalar("uint64")
+        nvl_barrier_start_clock = txl.local_scalar("uint64")
+        barrier_status_printf = txl.local_scalar("int32")
         k_idx_packed = txl.local_scalar("int32")
         m_idx = txl.local_scalar("int32")
         n_idx = txl.local_scalar("int32")
@@ -1550,7 +1550,6 @@ def get_kernel(
         combine_slot_mask = txl.local_scalar("uint32")
         combine_slot_idx = txl.local_scalar("int32")
         combine_token_idx = txl.local_scalar("int32")
-        combine_item_idx = txl.local_scalar("int32")
         combine_chunk_offset_elems = txl.local_scalar("int32")
         combine_do_reduce = txl.local_scalar("int32")
         combine_next_do_reduce = txl.local_scalar("int32")
@@ -1609,11 +1608,30 @@ def get_kernel(
         # so it must not arrive on any grid barrier in between.
         def workspace_grid_wait(counter_idx, sync_num_threads, sync_barrier_idx, sync_thread_idx):
             with txl.If(sync_thread_idx == 0), txl.Then():
-                wait_acq_u32(
-                    grid_sync_new_value,
-                    workspace_grid_sync_count.ptr_to([counter_idx]),
-                    lambda value: grid_sync_done_u32(value, grid_sync_old_value) != txl.uint32(0),
-                )
+                if strengthened:
+                    wait_acq_u32(
+                        grid_sync_new_value,
+                        workspace_grid_sync_count.ptr_to([counter_idx]),
+                        lambda value: grid_sync_done_u32(value, grid_sync_old_value) != txl.uint32(0),
+                    )
+                else:
+                    txl.assign(grid_sync_start_clock, txl.cuda.clock64())
+                    with txl.While(True):
+                        txl.ptx.ld.acquire.gpu.global_.u32(
+                            grid_sync_new_value, workspace_grid_sync_count.ptr_to([counter_idx]))
+                        with txl.If(txl.cuda.clock64() - grid_sync_start_clock
+                                    >= txl.uint64(60 * 2000000000)), txl.Then():
+                            txl.cuda.printf(
+                                "DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, "
+                                "old=%u, current=%u, expected_tag=%u\n",
+                                sm_idx, sync_thread_idx, txl.uint32(counter_idx),
+                                grid_sync_old_value, grid_sync_new_value,
+                                txl.bitwise_xor(grid_sync_old_value, txl.uint32(0x80000000)),
+                            )
+                            txl.cuda.trap_when_assert_failed(False)
+                        with txl.If(grid_sync_done_u32(grid_sync_new_value, grid_sync_old_value)
+                                    != txl.uint32(0)), txl.Then():
+                            txl.Break()
             txl.ptx.bar.sync(txl.uint32(sync_barrier_idx), txl.uint32(sync_num_threads))
 
         def workspace_grid_sync(counter_idx, sync_num_threads, sync_barrier_idx, sync_thread_idx):
@@ -1629,7 +1647,7 @@ def get_kernel(
             sync_prologue,
             sync_epilogue,
         ):
-            with txl.If(num_processes == 1):
+            with txl.If(num_processes == 1 and strengthened):
                 with txl.Then():
                     workspace_grid_sync(
                         counter_idx, sync_num_threads, sync_barrier_idx, sync_thread_idx
@@ -1672,11 +1690,37 @@ def get_kernel(
                             txl.assign(barrier_target, txl.int32(num_processes))
                             with txl.If(barrier_signal_sign != 0), txl.Then():
                                 txl.assign(barrier_target, txl.int32(0))
-                            wait_acq_sys_s32(
-                                barrier_status,
-                                workspace_nvl_barrier_signal.ptr_to([barrier_signal_phase]),
-                                lambda value: value == barrier_target,
-                            )
+                            if strengthened:
+                                wait_acq_sys_s32(
+                                    barrier_status,
+                                    workspace_nvl_barrier_signal.ptr_to([barrier_signal_phase]),
+                                    lambda value: value == barrier_target,
+                                )
+                            else:
+                                txl.assign(nvl_barrier_start_clock, txl.cuda.clock64())
+                                with txl.While(True):
+                                    txl.ptx.ld.acquire.sys.global_.s32(
+                                        barrier_status,
+                                        workspace_nvl_barrier_signal.ptr_to([barrier_signal_phase]),
+                                    )
+                                    with txl.If(barrier_status == barrier_target), txl.Then():
+                                        txl.Break()
+                                    with txl.If(txl.cuda.clock64() - nvl_barrier_start_clock
+                                                >= txl.uint64(60 * 2000000000)), txl.Then():
+                                        txl.ptx.ld.acquire.sys.global_.s32(
+                                            barrier_status_printf,
+                                            workspace_nvl_barrier_signal.ptr_to([barrier_signal_phase]),
+                                        )
+                                        load_global_u32(nvl_counter_value,
+                                                        workspace_nvl_barrier_counter.ptr_to([0]))
+                                        txl.cuda.printf(
+                                            "DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, "
+                                            "signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                                            rank_idx, txl.cast(nvl_counter_value, "int32"),
+                                            barrier_status_printf, barrier_target,
+                                            barrier_signal_phase, barrier_signal_sign, barrier_tag,
+                                        )
+                                        txl.cuda.trap_when_assert_failed(False)
                     with txl.If(sync_epilogue != 0), txl.Then():
                         workspace_grid_sync(
                             counter_idx, sync_num_threads, sync_barrier_idx, sync_thread_idx
@@ -1715,25 +1759,12 @@ def get_kernel(
                 1,
             )
 
-        def scheduler_fetch_expert_recv_count(after_dispatch_barrier=False):
-            with txl.serial(0, num_experts_per_lane) as expert_lane_idx:
+        def scheduler_fetch_expert_recv_count():
+            with txl.unroll(0, num_experts_per_lane) as expert_lane_idx:
                 txl.assign(dispatch_expert_idx, expert_lane_idx * 32 + lane_idx)
                 txl.assign(scheduler_cached_status, txl.uint64(0))
                 with txl.If(dispatch_expert_idx < num_experts_per_rank), txl.Then():
-                    if after_dispatch_barrier:
-                        # Every rank adds its counts here before it signals the
-                        # dispatch NVLink barrier, so past that barrier they are
-                        # final and one read suffices; a wait would close with
-                        # an `ld.acquire.sys` costing about 1 us per expert.
-                        txl.ptx.ld.relaxed.sys.global_.u64(
-                            scheduler_cached_status,
-                            workspace_expert_recv_count_sum.ptr_to([dispatch_expert_idx]),
-                        )
-                        txl.cuda.trap_when_assert_failed(
-                            txl.cast(txl.shift_right(scheduler_cached_status, 32), "int32")
-                            == kernel_config.num_sms * num_processes
-                        )
-                    else:
+                    if strengthened:
                         txl.cuda.wait_until(
                             scheduler_cached_status,
                             workspace_expert_recv_count_sum.ptr_to([dispatch_expert_idx]),
@@ -1742,6 +1773,15 @@ def get_kernel(
                             scope="sys",
                             ptx_type="u64",
                         )
+                    else:
+                        with txl.While(True):
+                            txl.ptx.ld.volatile.global_.u64(
+                                scheduler_cached_status,
+                                workspace_expert_recv_count_sum.ptr_to([dispatch_expert_idx]),
+                            )
+                            with txl.If(txl.cast(txl.shift_right(scheduler_cached_status, 32), "uint32")
+                                        == kernel_config.num_sms * num_processes), txl.Then():
+                                txl.Break()
                 txl.ptx.mov.b32(
                     stored_num_tokens_per_expert[expert_lane_idx],
                     txl.cast(txl.bitwise_and(scheduler_cached_status, txl.uint64(0xFFFFFFFF)), "uint32"),
@@ -1966,13 +2006,17 @@ def get_kernel(
                             (task_info_regs[4] + txl.uint32(1)) * txl.uint32(num_l1_clusters),
                         )
                         sched_l1_count = txl.local_scalar("uint32", init=txl.uint32(0))
-                        txl.cuda.wait_until(
-                            sched_l1_count,
-                            workspace_l1_task_count.ptr_to([0]),
-                            sched_l1_count >= sched_required_l1_tasks,
-                            scope="sys",
-                            ptx_type="u32",
-                        )
+                        if strengthened:
+                            txl.cuda.wait_until(
+                                sched_l1_count, workspace_l1_task_count.ptr_to([0]),
+                                sched_l1_count >= sched_required_l1_tasks,
+                                scope="sys", ptx_type="u32",
+                            )
+                        else:
+                            with txl.While(True):
+                                load_volatile_u32(sched_l1_count, workspace_l1_task_count.ptr_to([0]))
+                                with txl.If(sched_l1_count >= sched_required_l1_tasks), txl.Then():
+                                    txl.Break()
                         txl.assign(sched_task_valid, txl.int32(1))
 
         def producer_publish_task():
@@ -2374,10 +2418,10 @@ def get_kernel(
                                             txl.address_of(tmem_ptr_in_smem[0]),
                                             txl.uint32(num_tmem_cols),
                                         )
-            # `fence_barrier_init` publishes the earlier mbarrier initialization,
-            # but the tcgen05.alloc above performs a later weak shared-memory store
-            # of the TMEM base.  Publish that store before epilogue warps read it.
-            txl.ptx.barrier.cluster.arrive.release.aligned()
+            if strengthened:
+                txl.ptx.barrier.cluster.arrive.release.aligned()
+            else:
+                txl.ptx.barrier.cluster.arrive.relaxed.aligned()
             txl.ptx.barrier.cluster.wait.acquire.aligned()
 
         def dispatch(role_warp_idx, role_thread_idx):
@@ -2581,7 +2625,7 @@ def get_kernel(
             txl.assign(expert_end_idx, txl.int32(0))
             txl.assign(pull_pool_block_offset, txl.int32(0))
             # Wait token data arrival
-            scheduler_fetch_expert_recv_count(after_dispatch_barrier=True)
+            scheduler_fetch_expert_recv_count()
             txl.assign(dispatch_token_iter, sm_idx * kernel_config.num_dispatch_warps + role_warp_idx)
             with txl.While(True):
                 txl.assign(old_expert_idx, current_expert_idx)
@@ -2885,28 +2929,25 @@ def get_kernel(
                         + kernel_config.num_sms * kernel_config.num_dispatch_warps
                     ),
                 )
-            # Dispatch and load-A read reusable global workspace after the
-            # preceding grid rendezvous. The epilogue grid rendezvous cannot
-            # publish those reads because it precedes the CTA-local join
-            # below, so they take a grid barrier of their own. They arrive as
-            # soon as their reads are done, and the clean waits.
-            workspace_grid_arrive(
-                dispatch_grid_sync_index,
-                kernel_config.num_dispatch_threads + 32,
-                dispatch_with_load_a_sync_barrier_idx,
-                role_thread_idx,
-                aligned=False,
-            )
+            if strengthened:
+                workspace_grid_arrive(
+                    dispatch_grid_sync_index,
+                    kernel_config.num_dispatch_threads + 32,
+                    dispatch_with_load_a_sync_barrier_idx,
+                    role_thread_idx,
+                    aligned=False,
+                )
             sync_unaligned(
                 dispatch_with_epilogue_sync_barrier_idx,
                 kernel_config.num_dispatch_threads + kernel_config.num_epilogue_threads,
             )
-            workspace_grid_wait(
-                dispatch_grid_sync_index,
-                kernel_config.num_dispatch_threads,
-                dispatch_sync_barrier_idx,
-                role_thread_idx,
-            )
+            if strengthened:
+                workspace_grid_wait(
+                    dispatch_grid_sync_index,
+                    kernel_config.num_dispatch_threads,
+                    dispatch_sync_barrier_idx,
+                    role_thread_idx,
+                )
             with txl.If(sm_idx == 0):
                 with txl.Then():
                     # SM 0: clear expert send count and schedule task counters
@@ -3081,11 +3122,8 @@ def get_kernel(
                             load_a_wait_l1_full()
                         with txl.Else():
                             load_a_wait_l2_full()
-                # The release/acquire counters publish generic global stores
-                # from dispatch (L1) or the preceding epilogue's scale-factor
-                # writes (L2).  TMA reads through the async proxy, so bridge the
-                # acquired frontier before loading either ring.
-                txl.ptx.fence.proxy.async_.global_()
+                if strengthened:
+                    txl.ptx.fence.proxy.async_.global_()
                 with txl.serial(0, num_k_blocks) as k_block_idx:
                     barrier_wait(
                         empty_barriers.ptr_to([pipeline_state.stage]),
@@ -3134,11 +3172,11 @@ def get_kernel(
                                 full_barrier_arrive_cta0(full_barrier_ptr)
                     txl.cuda.warp_sync()
                     advance_pipeline()
-            # Load-A's half of the dispatch arrive before the workspace clean.
-            txl.ptx.barrier.sync(
-                txl.uint32(dispatch_with_load_a_sync_barrier_idx),
-                txl.uint32(kernel_config.num_dispatch_threads + 32),
-            )
+            if strengthened:
+                txl.ptx.barrier.sync(
+                    txl.uint32(dispatch_with_load_a_sync_barrier_idx),
+                    txl.uint32(kernel_config.num_dispatch_threads + 32),
+                )
 
         def load_b():
             init_gemm_context()
@@ -4104,39 +4142,26 @@ def get_kernel(
                             txl.uint32(kernel_config.num_epilogue_threads),
                         )
             txl.assign(epilogue_thread_idx, role_thread_idx)
-            epilogue_nvlink_barrier_before_combine_reduce(epilogue_thread_idx)
-            # The grid barrier above includes every epilogue thread in both CTAs,
-            # so no peer can still be accessing TMEM when warp 0 deallocates it.
+            if strengthened:
+                epilogue_nvlink_barrier_before_combine_reduce(epilogue_thread_idx)
             with txl.If(epilogue_warp_idx == 0), txl.Then():
                 txl.ptx[
                     f"tcgen05.dealloc.cta_group::{kernel_config.num_ctas_per_cluster}.sync.aligned.b32"
                 ](txl.uint32(0), txl.uint32(num_tmem_cols))
+            if not strengthened:
+                epilogue_nvlink_barrier_before_combine_reduce(epilogue_thread_idx)
             sync_unaligned(
                 dispatch_with_epilogue_sync_barrier_idx,
                 kernel_config.num_dispatch_threads + kernel_config.num_epilogue_threads,
             )
-            # The preceding grid barrier publishes every epilogue's generic
-            # stores into the symmetric combine-token buffer.  Combine reads
-            # those stores through TMA's async global proxy.
-            txl.ptx.fence.proxy.async_.global_()
-            # Combine also reuses the shared pool previously read by MMA and
-            # written by dispatch, crossing the async/generic proxy boundary.
-            tma_store_fence()
-            # Each warp takes (token, chunk) items, so the chunks of one token
-            # reduce on different warps rather than back to back on one warp
-            # as in DeepGEMM.
+            if strengthened:
+                txl.ptx.fence.proxy.async_.global_()
+                tma_store_fence()
             txl.assign(
-                combine_item_idx, sm_idx * kernel_config.num_epilogue_warps + epilogue_warp_idx
+                combine_token_idx, sm_idx * kernel_config.num_epilogue_warps + epilogue_warp_idx
             )
             combine_state.init(0)
-            with txl.While(
-                txl.cast(combine_item_idx, "uint32") < txl.cast(num_tokens * num_chunks, "uint32")
-            ):
-                txl.assign(combine_token_idx, combine_item_idx // num_chunks)
-                txl.assign(
-                    combine_chunk_offset_elems,
-                    (combine_item_idx % num_chunks) * (num_chunk_bytes // 2),
-                )
+            with txl.While(txl.cast(combine_token_idx, "uint32") < txl.cast(num_tokens, "uint32")):
                 txl.assign(combine_stored_topk_slot_idx, txl.int32(-1))
                 with txl.If(lane_idx < num_topk), txl.Then():
                     load_global_s64(
@@ -4154,36 +4179,13 @@ def get_kernel(
                     txl.uint32(0xFFFFFFFF),
                     combine_stored_topk_slot_idx >= txl.int32(0),
                 )
-                txl.assign(combine_slot_mask, combine_total_mask)
-                with txl.unroll(0, num_uint4_per_lane * num_elems_per_uint4) as reduced_idx:
-                    txl.ptx.mov.b32(reduced[reduced_idx, 0], txl.float32(0.0))
-                    txl.ptx.mov.b32(reduced[reduced_idx, 1], txl.float32(0.0))
-                txl.assign(combine_do_reduce, txl.int32(0))
-                with txl.If(combine_slot_mask != txl.uint32(0)), txl.Then():
-                    txl.assign(combine_slot_idx, ffs_u32(combine_slot_mask) - txl.int32(1))
-                    txl.assign(
-                        combine_slot_mask,
-                        txl.bitwise_xor(
-                            combine_slot_mask,
-                            txl.shift_left(txl.uint32(1), txl.cast(combine_slot_idx, "uint32")),
-                        ),
-                    )
-                    with txl.If(txl.cuda.elect_sync()), txl.Then():
-                        src_ptr = combine_tokens.ptr_to(
-                            [combine_slot_idx, combine_token_idx, combine_chunk_offset_elems]
-                        )
-                        load_barrier_ptr = combine_barriers.ptr_to(
-                            [epilogue_warp_idx * 2 + combine_state.stage]
-                        )
-                        load_buffer_ptr = combine_chunks.ptr_to(
-                            [combine_state.stage, epilogue_warp_idx, 0, 0]
-                        )
-                        tma_load_1d(load_buffer_ptr, src_ptr, load_barrier_ptr, num_chunk_bytes)
-                        mbarrier_arrive_and_set_tx(load_barrier_ptr, num_chunk_bytes)
-                    txl.assign(combine_do_reduce, txl.int32(1))
-                txl.cuda.warp_sync()
-                with txl.While(combine_do_reduce != txl.int32(0)):
-                    txl.assign(combine_next_do_reduce, txl.int32(0))
+                with txl.serial(0, num_chunks) as combine_chunk_idx:
+                    txl.assign(combine_chunk_offset_elems, combine_chunk_idx * (num_chunk_bytes // 2))
+                    txl.assign(combine_slot_mask, combine_total_mask)
+                    with txl.unroll(0, num_uint4_per_lane * num_elems_per_uint4) as reduced_idx:
+                        txl.ptx.mov.b32(reduced[reduced_idx, 0], txl.float32(0.0))
+                        txl.ptx.mov.b32(reduced[reduced_idx, 1], txl.float32(0.0))
+                    txl.assign(combine_do_reduce, txl.int32(0))
                     with txl.If(combine_slot_mask != txl.uint32(0)), txl.Then():
                         txl.assign(combine_slot_idx, ffs_u32(combine_slot_mask) - txl.int32(1))
                         txl.assign(
@@ -4198,79 +4200,102 @@ def get_kernel(
                                 [combine_slot_idx, combine_token_idx, combine_chunk_offset_elems]
                             )
                             load_barrier_ptr = combine_barriers.ptr_to(
-                                [epilogue_warp_idx * 2 + (combine_state.stage ^ txl.int32(1))]
+                                [epilogue_warp_idx * 2 + combine_state.stage]
                             )
-                            prefetch_buffer_ptr = combine_chunks.ptr_to(
-                                [combine_state.stage ^ txl.int32(1), epilogue_warp_idx, 0, 0]
+                            load_buffer_ptr = combine_chunks.ptr_to(
+                                [combine_state.stage, epilogue_warp_idx, 0, 0]
                             )
-                            tma_load_1d(
-                                prefetch_buffer_ptr, src_ptr, load_barrier_ptr, num_chunk_bytes
-                            )
+                            tma_load_1d(load_buffer_ptr, src_ptr, load_barrier_ptr, num_chunk_bytes)
                             mbarrier_arrive_and_set_tx(load_barrier_ptr, num_chunk_bytes)
-                        txl.assign(combine_next_do_reduce, txl.int32(1))
+                        txl.assign(combine_do_reduce, txl.int32(1))
                     txl.cuda.warp_sync()
-                    mbarrier_wait_phase(
-                        combine_barriers.ptr_to([epilogue_warp_idx * 2 + combine_state.stage]),
-                        combine_state.phase,
-                    )
+                    with txl.While(combine_do_reduce != txl.int32(0)):
+                        txl.assign(combine_next_do_reduce, txl.int32(0))
+                        with txl.If(combine_slot_mask != txl.uint32(0)), txl.Then():
+                            txl.assign(combine_slot_idx, ffs_u32(combine_slot_mask) - txl.int32(1))
+                            txl.assign(
+                                combine_slot_mask,
+                                txl.bitwise_xor(
+                                    combine_slot_mask,
+                                    txl.shift_left(txl.uint32(1), txl.cast(combine_slot_idx, "uint32")),
+                                ),
+                            )
+                            with txl.If(txl.cuda.elect_sync()), txl.Then():
+                                src_ptr = combine_tokens.ptr_to(
+                                    [combine_slot_idx, combine_token_idx, combine_chunk_offset_elems]
+                                )
+                                load_barrier_ptr = combine_barriers.ptr_to(
+                                    [epilogue_warp_idx * 2 + (combine_state.stage ^ txl.int32(1))]
+                                )
+                                prefetch_buffer_ptr = combine_chunks.ptr_to(
+                                    [combine_state.stage ^ txl.int32(1), epilogue_warp_idx, 0, 0]
+                                )
+                                tma_load_1d(
+                                    prefetch_buffer_ptr, src_ptr, load_barrier_ptr, num_chunk_bytes
+                                )
+                                mbarrier_arrive_and_set_tx(load_barrier_ptr, num_chunk_bytes)
+                            txl.assign(combine_next_do_reduce, txl.int32(1))
+                        txl.cuda.warp_sync()
+                        mbarrier_wait_phase(
+                            combine_barriers.ptr_to([epilogue_warp_idx * 2 + combine_state.stage]),
+                            combine_state.phase,
+                        )
+                        with txl.unroll(0, num_uint4_per_lane) as j:
+                            load_ptr = combine_chunks.ptr_to(
+                                [combine_state.stage, epilogue_warp_idx, j * 32 + lane_idx, 0]
+                            )
+                            lds128(load_ptr, epilogue_bf16_packed)
+                            with txl.unroll(0, num_elems_per_uint4) as elem_idx:
+                                # d = convert(a) + c, accumulating in place.
+                                txl.ptx.add.rn.f32.bf16(
+                                    reduced[j * num_elems_per_uint4 + elem_idx, 0],
+                                    bf16x2_lo(epilogue_bf16_packed[elem_idx]),
+                                    reduced[j * num_elems_per_uint4 + elem_idx, 0],
+                                )
+                                txl.ptx.add.rn.f32.bf16(
+                                    reduced[j * num_elems_per_uint4 + elem_idx, 1],
+                                    bf16x2_hi(epilogue_bf16_packed[elem_idx]),
+                                    reduced[j * num_elems_per_uint4 + elem_idx, 1],
+                                )
+                        if strengthened:
+                            with txl.If(combine_slot_mask != txl.uint32(0)), txl.Then():
+                                tma_store_fence()
+                                txl.cuda.warp_sync()
+                        combine_state.advance()
+                        txl.assign(combine_do_reduce, combine_next_do_reduce)
                     with txl.unroll(0, num_uint4_per_lane) as j:
-                        load_ptr = combine_chunks.ptr_to(
-                            [combine_state.stage, epilogue_warp_idx, j * 32 + lane_idx, 0]
-                        )
-                        lds128(load_ptr, epilogue_bf16_packed)
                         with txl.unroll(0, num_elems_per_uint4) as elem_idx:
-                            # d = convert(a) + c, accumulating in place.
-                            txl.ptx.add.rn.f32.bf16(
-                                reduced[j * num_elems_per_uint4 + elem_idx, 0],
-                                bf16x2_lo(epilogue_bf16_packed[elem_idx]),
-                                reduced[j * num_elems_per_uint4 + elem_idx, 0],
+                            txl.ptx.mov.b32(
+                                epilogue_bf16_packed[elem_idx],
+                                cast_into_bf16_and_pack(
+                                    reduced[j * num_elems_per_uint4 + elem_idx, 0],
+                                    reduced[j * num_elems_per_uint4 + elem_idx, 1],
+                                ),
                             )
-                            txl.ptx.add.rn.f32.bf16(
-                                reduced[j * num_elems_per_uint4 + elem_idx, 1],
-                                bf16x2_hi(epilogue_bf16_packed[elem_idx]),
-                                reduced[j * num_elems_per_uint4 + elem_idx, 1],
-                            )
-                    # A later selection reuses this load stage through TMA's
-                    # async proxy. Publish every lane's completed generic
-                    # loads before the elected lane can issue that overwrite.
-                    with txl.If(combine_slot_mask != txl.uint32(0)), txl.Then():
-                        tma_store_fence()
-                        txl.cuda.warp_sync()
-                    combine_state.advance()
-                    txl.assign(combine_do_reduce, combine_next_do_reduce)
-                with txl.unroll(0, num_uint4_per_lane) as j:
-                    with txl.unroll(0, num_elems_per_uint4) as elem_idx:
-                        txl.ptx.mov.b32(
-                            epilogue_bf16_packed[elem_idx],
-                            cast_into_bf16_and_pack(
-                                reduced[j * num_elems_per_uint4 + elem_idx, 0],
-                                reduced[j * num_elems_per_uint4 + elem_idx, 1],
-                            ),
+                        with txl.If(j == 0), txl.Then():
+                            tma_store_wait(0)
+                            txl.cuda.warp_sync()
+                        combine_store_ptr = combine_chunks.ptr_to(
+                            [2, epilogue_warp_idx, j * 32 + lane_idx, 0]
                         )
-                    with txl.If(j == 0), txl.Then():
-                        tma_store_wait(0)
-                        txl.cuda.warp_sync()
-                    combine_store_ptr = combine_chunks.ptr_to(
-                        [2, epilogue_warp_idx, j * 32 + lane_idx, 0]
-                    )
-                    txl.ptx.st.shared.v4.b32(
-                        combine_store_ptr,
-                        epilogue_bf16_packed[0],
-                        epilogue_bf16_packed[1],
-                        epilogue_bf16_packed[2],
-                        epilogue_bf16_packed[3],
-                    )
-                txl.cuda.warp_sync()
-                with txl.If(txl.cuda.elect_sync()), txl.Then():
-                    tma_store_fence()
-                    dst_ptr = y.ptr_to([combine_token_idx * hidden + combine_chunk_offset_elems])
-                    combine_store_ptr = combine_chunks.ptr_to([2, epilogue_warp_idx, 0, 0])
-                    tma_store_1d(dst_ptr, combine_store_ptr, num_chunk_bytes)
-                    tma_store_arrive()
-                txl.cuda.warp_sync()
+                        txl.ptx.st.shared.v4.b32(
+                            combine_store_ptr,
+                            epilogue_bf16_packed[0],
+                            epilogue_bf16_packed[1],
+                            epilogue_bf16_packed[2],
+                            epilogue_bf16_packed[3],
+                        )
+                    txl.cuda.warp_sync()
+                    with txl.If(txl.cuda.elect_sync()), txl.Then():
+                        tma_store_fence()
+                        dst_ptr = y.ptr_to([combine_token_idx * hidden + combine_chunk_offset_elems])
+                        combine_store_ptr = combine_chunks.ptr_to([2, epilogue_warp_idx, 0, 0])
+                        tma_store_1d(dst_ptr, combine_store_ptr, num_chunk_bytes)
+                        tma_store_arrive()
+                    txl.cuda.warp_sync()
                 txl.assign(
-                    combine_item_idx,
-                    combine_item_idx + kernel_config.num_sms * kernel_config.num_epilogue_warps,
+                    combine_token_idx,
+                    combine_token_idx + kernel_config.num_sms * kernel_config.num_epilogue_warps,
                 )
 
         prologue()

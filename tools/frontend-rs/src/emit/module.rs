@@ -193,6 +193,7 @@ struct KernelItem {
     clusters: i64,
     ctas_per_cluster: i64,
     warps_per_cta: i64,
+    threads_per_cta: i64,
     warp_function: String,
     analysis_warp_function: String,
     execute_function: String,
@@ -404,6 +405,7 @@ fn render_kernel(
         clusters: topology.clusters,
         ctas_per_cluster: topology.ctas_per_cluster,
         warps_per_cta: topology.warps_per_cta,
+        threads_per_cta: topology.threads_per_cta,
         warp_function,
         analysis_warp_function,
         execute_function: if single {
@@ -1229,6 +1231,7 @@ const RUN_PHASE_TEMPLATE: &str = r#"    if selected_phase.is_none() || selected_
             __NUMSIM_WARPS_PER_CTA__,
             rank_inputs.len(),
         )
+        .and_then(|topology| topology.with_cta_threads(__NUMSIM_THREADS_PER_CTA__))
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let physical = PhysicalMemory::with_global(topology, global.clone());
         let selection = extract_phase_selection(
@@ -1278,6 +1281,7 @@ const SYNC_PHASE_TEMPLATE: &str = r#"        __NUMSIM_INDEX___usize => {
                 __NUMSIM_WARPS_PER_CTA__,
                 rank_inputs.len(),
             )
+            .and_then(|topology| topology.with_cta_threads(__NUMSIM_THREADS_PER_CTA__))
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
             let physical = PhysicalMemory::with_global(topology, global.clone());
             let selection = extract_selection(subset, topology)?;
@@ -1332,6 +1336,7 @@ const RACE_PHASE_TEMPLATE: &str = r#"        __NUMSIM_INDEX___usize => {
                 __NUMSIM_WARPS_PER_CTA__,
                 rank_inputs.len(),
             )
+            .and_then(|topology| topology.with_cta_threads(__NUMSIM_THREADS_PER_CTA__))
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
             let physical = PhysicalMemory::with_global(topology, global.clone());
             let selection = extract_selection(subset, topology)?;
@@ -1527,8 +1532,8 @@ pub fn emit_rust_module(
         .iter()
         .map(|item| {
             format!(
-                "({}_usize, {}_usize, {}_usize)",
-                item.clusters, item.ctas_per_cluster, item.warps_per_cta
+                "({}_usize, {}_usize, {}_usize, {}_usize)",
+                item.clusters, item.ctas_per_cluster, item.warps_per_cta, item.threads_per_cta
             )
         })
         .collect();
@@ -1542,6 +1547,10 @@ pub fn emit_rust_module(
                 item.ctas_per_cluster.to_string(),
             ),
             ("warps_per_cta".to_owned(), item.warps_per_cta.to_string()),
+            (
+                "threads_per_cta".to_owned(),
+                item.threads_per_cta.to_string(),
+            ),
             ("kernel_count".to_owned(), count_text.clone()),
             ("prepare_function".to_owned(), item.prepare_function.clone()),
             ("tmem_columns".to_owned(), item.tmem_columns.to_string()),

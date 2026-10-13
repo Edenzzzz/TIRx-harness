@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 
 from benchmarks.multimem import common
 
@@ -29,19 +30,17 @@ LAUNCHES = 100
 
 
 def _tirx_launcher(rank: int, world: int, shape, workspace):
-    import tvm
+    from tirx_kernels.runner import compile_kernel
 
     from ported.cutlass.sm100_all_reduce import TILE, two_shot_all_reduce
 
     func = two_shot_all_reduce(shape[0] // TILE, world, shape[1] // TILE)
-    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
-    with target:
-        executable = tvm.compile(tvm.IRModule({"main": func}), target=target,
-                                 tir_pipeline="tirx")
+    func = func.specialize({func.params[0]: rank})
+    executable = compile_kernel(func)
 
     def launcher(ws):
         def launch():
-            executable(rank, ws["in"], ws["out"], ws["in_mc"], ws["out_mc"], ws["flag"],
+            executable(ws["in"], ws["out"], ws["in_mc"], ws["out_mc"], ws["flag"],
                        ws["flag_mc"])
         return launch
 
@@ -91,18 +90,40 @@ def rank_main(rank: int, world: int, shapes: list[list[int]]) -> list[dict]:
             "cutlass": origins.two_shot_launchers(rank, world, workspace),
             "tirx": _tirx_launcher(rank, world, (m, n), workspace),
         }
+        outputs = {}
         for name, closures in impls.items():
             _check(name, closures[0], workspace[0], reference)
+            outputs[name] = workspace[0]["out"].clone()
+        equal = torch.tensor([torch.equal(outputs["cutlass"], outputs["tirx"])],
+                             dtype=torch.int32, device=device)
+        dist.all_reduce(equal, op=dist.ReduceOp.MIN)
+        if not bool(equal.item()):
+            raise RuntimeError(f"{m}x{n}: TIRx does not match CUTLASS bitwise")
         times = common.slowest_rank(common.time_launches(impls, launches=LAUNCHES, trials=9))
         rows.append({"M": m, "N": n, "MiB": m * n * 4 / 2**20,
+                     "comparison_kind": "port_fidelity", "bitwise_equal": True,
                      "cutlass_us": times["cutlass"], "tirx_us": times["tirx"],
                      "ratio": times["tirx"] / times["cutlass"]})
         if rank == 0:
             print(json.dumps(rows[-1]), flush=True)
-        del workspace, impls
+        del workspace, impls, outputs
         torch.cuda.synchronize()
         dist.barrier()
     return rows
+
+
+def validate_rows(rows, shapes):
+    observed = {(row["M"], row["N"]): row for row in rows
+                if row.get("comparison_kind") == "port_fidelity"}
+    failures = []
+    for rows_count, columns in shapes:
+        row = observed.get((rows_count, columns))
+        ratio = row.get("ratio", math.inf) if row else math.inf
+        if (not row or not row.get("bitwise_equal") or not math.isfinite(ratio)
+                or ratio <= 0 or ratio > 1 / 0.99):
+            failures.append(f"{rows_count}x{columns}")
+    if not shapes or failures:
+        raise RuntimeError("Two-shot fidelity validation failed: " + ", ".join(failures))
 
 
 def main() -> None:
@@ -122,6 +143,7 @@ def main() -> None:
     if args.json:
         with open(args.json, "w") as f:
             json.dump(rows, f, indent=1)
+    validate_rows(rows, shapes)
 
 
 if __name__ == "__main__":

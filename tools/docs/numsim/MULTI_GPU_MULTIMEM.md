@@ -142,17 +142,18 @@ checks both relaxed and release RMW reads, including negative controls for a
 fence before the read and for a reduction with no returned read. The release
 RMW case reproduced a false positive before the observation-preservation fix.
 
-The full-scale GEMM port also has direct tests. Its numerical, Racecheck, and
-Synccheck matrix passes in the supported Linux environment; the IR and
-benchmark-evidence checks also pass. GPU performance closure remains separate:
+The full-scale GEMM builder has separate faithful-port and strengthened-semantic
+tests. `origin` preserves the baseline's operations and checker findings;
+`sys_fenced` is an explicit positive semantic example, not a performance port.
+Passing the latter's checks does not validate the former's memory ordering:
 
 | File | Obligation |
 |---|---|
-| [Full-kernel IR checks](../../tests/numsim/registry/test_multimem_port_ordering.py) | `test_full_kernel_defaults_to_system_publication`: both schedules, direct/TMA epilogues, one/two-CTA variants, fixed/runtime rank, `.sys` arrivals/polls, and alias fences; `test_origin_ordering_requires_explicit_opt_in`: historical signaling is explicit. |
-| [Full-kernel numerical tests](../../tests/numsim/runtime/test_full_multimem_gemm.py) | `test_full_gemm_all_reduce_matches_reference`: both schedules, direct/TMA epilogues, f32/bf16/f16 results, two/four ranks, independent float64 reference, and reset flags. `test_full_gemm_multiple_ctas_publish_and_reset` also covers multiple persistent clusters, one/two-CTA MMA, and uneven work counts. |
+| [Full-kernel IR checks](../../tests/numsim/registry/test_multimem_port_ordering.py) | `test_full_kernel_defaults_to_baseline_ordering`, `test_baseline_flag_operations_use_elected_leaders`, and `test_baseline_bulk_store_waits_are_not_silently_strengthened` preserve the baseline's synchronization. `test_full_kernel_system_publication_is_explicit` checks the separate `.sys`/alias-fenced example. `test_two_shot_matches_the_baseline_constexpr_loop` preserves the original unroll contract. |
+| [Full-kernel numerical tests](../../tests/numsim/runtime/test_full_multimem_gemm.py) | `test_full_gemm_all_reduce_matches_reference`: explicit `sys_fenced` examples, both schedules, direct/TMA epilogues, f32/bf16/f16 results, two/four ranks, independent float64 reference, and reset flags. `test_full_gemm_multiple_ctas_publish_and_reset` also covers multiple persistent clusters, one/two-CTA MMA, and uneven work counts. |
 | [Full-kernel Racecheck tests](../../tests/analysis_tools/racecheck/test_native_full_multimem_gemm.py) | `test_full_gemm_system_publication_is_clean` and `test_full_gemm_multiple_ctas_publish_every_writer`: system-scope publication and alias bridges cover every participating writer. `test_full_gemm_multiple_ctas_require_the_alias_bridge` removes the fences and requires a race; `test_full_gemm_origin_signaling_leaves_cross_rank_conflicts` retains the original-signaling counterexample. |
 | [Full-kernel Synccheck tests](../../tests/analysis_tools/synccheck/test_native_full_multimem_gemm.py) | `test_full_gemm_pipeline_and_system_flag_waits_complete` and `test_full_gemm_multiple_ctas_finish_the_rank_barrier`: pipeline barriers and cross-rank waits complete with multiple persistent clusters and uneven work counts. |
-| [Benchmark evidence tests](../../tests/test_multigpu_benchmarks.py) | Historical signaling results cannot validate the corrected kernel; missing shapes/origins, wrong output, invalid timing, and performance below 99% fail the comparison. |
+| [Benchmark evidence tests](../../tests/test_multigpu_benchmarks.py) | Unlabelled history and measurements of another ordering mode cannot validate either kernel. Missing shapes/origins, wrong output, invalid timing, and performance below 99% fail the comparison. |
 
 `tests/numsim/support/runtime_cases.py` registers these tests as the runtime
 cases of the new ops, which `test_operation_runtime_cases.py` requires.
@@ -458,9 +459,10 @@ Synccheck has no multimem-specific code:
 
 ### ABI
 
-`NUMSIM_ABI_VERSION` is 40, in both `numsim/abi.py` and `engine-rs/src/lib.rs`
+`NUMSIM_ABI_VERSION` is 41, in both `numsim/abi.py` and `engine-rs/src/lib.rs`
 (39 added multimem; 40 added the peer-memory `rank_mappings`, see
-[MULTI_GPU_PEER.md](MULTI_GPU_PEER.md)). Stale artifacts are rejected.
+[MULTI_GPU_PEER.md](MULTI_GPU_PEER.md); 41 retains exact CTA thread counts,
+including partial warps). Stale artifacts are rejected.
 
 ## POC kernels
 
@@ -551,29 +553,35 @@ all-reduce warp count with the origins' formulas. A configuration therefore
 yields the same schedule as the origin built with it.
 
 `protocol` chooses the origin's schedule and in-place/out-of-place data
-placement. Both default to `ordering="sys_fenced"`: complete the epilogue's
-stores, bridge the alias before a `.sys` release, then acquire at `.sys` and
-bridge the alias before the all-reduce reads. `ordering="origin"` keeps the
-GPU-scoped/relaxed signaling only for counterexamples and historical
-comparisons. It is not the benchmark default.
+placement. Both the builder and benchmark default to `ordering="origin"`:
+preserve the baseline's instructions, waits, and signaling rather than repairing
+or optimizing them. Numerical/performance parity is distinct from checker
+cleanliness; findings inherited from the source must remain visible.
 
-The full-kernel tests call this same builder with `rank=None`, making rank a
-runtime scalar, and bind its unicast `out` for result inspection. The smaller
+`ordering="sys_fenced"` is a separate strengthened semantic example: complete
+the epilogue's stores, join direct-store writers, bridge the alias before a
+`.sys` release, then acquire at `.sys` and bridge the alias before the reads.
+It is not evidence of baseline-faithful performance. Select it explicitly with
+`compare --ordering sys_fenced` when measuring that example.
+
+The full-kernel tests select the ordering mode explicitly and use `rank=None`,
+making rank a runtime scalar, with unicast `out` for result inspection. The smaller
 `multimem_kernels.gemm_all_reduce_two_shot` remains the focused rule litmus.
 NumSim binding/reference code stays in `tests/numsim/support/`; neither port
 imports the harness or its tests.
 
-### Where the ports differ from the origins
+### Baseline behavior and separate semantic repairs
 
 - **CUTLASS's store wait.** CUTLASS releases a tile's flag after
   `PipelineTmaStore.producer_tail()`, which is
   `cp.async.bulk.wait_group.read 0`. That waits until the TMA store has read
   shared memory, not until C reaches global memory, so a peer's `ld_reduce` may
   read stale C. Racecheck's `read_only_store_wait` counterexample is this
-  pattern. TIRx waits with `cp.async.bulk.wait_group 0`.
+  pattern. The faithful port keeps the read-only wait; only `sys_fenced`
+  changes it to `cp.async.bulk.wait_group 0`.
 - **FlashInfer's direct-store epilogue** (`use_tma_store=False`). Warp 0
-  arrives without first joining the other epilogue warps' stores. TIRx joins
-  the four warps before the arrive.
+  arrives without first joining the other epilogue warps' stores. The faithful
+  port preserves that behavior; only `sys_fenced` adds the join.
 - **FlashInfer's final barrier.** It passes the CAS operands swapped (CUTLASS
   issue 2845), so the barrier neither waits for the other ranks nor resets its
   flag. A second launch on the same flags then does not synchronize, and a
@@ -584,8 +592,9 @@ imports the harness or its tests.
 ### Benchmark method
 
 `benchmarks/multimem/` holds the benchmarks. They import the origin kernels
-unchanged from `$CUTLASS_DIR` and `$FLASHINFER_DIR`; `origins.py` restates
-only the host wrappers, so that launches go on the capturing stream.
+from `$CUTLASS_DIR` and `$FLASHINFER_DIR`; `origins.py` restates the host wrappers
+so launches go on the capturing stream. The FlashInfer terminal-CAS correction
+above is the one explicit reference fix; it is not a performance optimization.
 
 From `tools/`, on a host with 4 multicast-capable GPUs:
 
@@ -662,8 +671,10 @@ The shape lists live in `two_shot_all_reduce.py` and `gemm_all_reduce.py`.
 
 ### Results
 
-These are historical origin-ordering measurements, not measurements of the
-new system-ordered default. Every recorded shape meets the bar. The worst
+These are historical measurements. The earlier port included synchronization
+changes and a CUTLASS exit-fence workaround, so these tables alone do not prove
+the restored port's instruction/schedule fidelity. Every recorded shape meets
+the numerical/performance bar for that measured implementation. The worst
 ratios are 1.003 for the two-shot
 all-reduce and 1.008 for the GEMM + all-reduce. Every compared configuration
 passed its correctness check, and every TIRx GEMM + all-reduce output equals

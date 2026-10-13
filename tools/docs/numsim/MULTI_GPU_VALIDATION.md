@@ -6,7 +6,71 @@ tests come first in [multimem](MULTI_GPU_MULTIMEM.md) and
 [peer memory](MULTI_GPU_PEER.md). This page distinguishes existing evidence
 from the work needed to close the correctness and performance goal.
 
+## Port-fidelity requirement
+
+This is a port and TIRx proof of concept, not an optimization project. The
+performance gate compares the baseline's instructions, memory-ordering forms,
+work partition, pipeline, and launch schedule. Newer instructions, stronger
+protocols, fused launches, or redistributed work cannot establish IR parity.
+Investigate lowering, generated code, compiler settings, and unintended
+differences instead. Keep checker findings separate; do not repair a baseline
+silently to make an example clean.
+
+The current audit found:
+
+| Kernel | Fidelity status |
+|---|---|
+| Two-shot all-reduce | Preserves the baseline's data layout, constexpr loop/rank, and terminal release/relaxed-CAS protocol. All 18 shapes and the independent repeat now pass bitwise equality, independent-reference precision, flag reset, and the unchanged 99% performance gate. |
+| GEMM + all-reduce | Restored baseline waits, elected leaders, and barrier sequence; removed the added exit GPU fence. All 19 shapes, both origins, three matched configurations, and the independent repeat now meet the unchanged precision/performance gate. `sys_fenced` remains a separate semantic example. |
+| All-gather GEMM | `benchmarks.peer.fidelity` restores CUTLASS's per-shard launches, exact auxiliary kernels, and common host schedule. The components pass numerical simulation; the full GPU parity matrix remains open. The earlier fused/chunked and NumSim copy-warp variants are separate examples, not fidelity evidence. |
+| Mega MoE | The default restores the audited 60-second timeout paths, volatile/readonly loads, combine work partition, relaxed cluster arrival, TMEM release placement, and barrier/fence sequence. `sys_fenced` is an explicit separate semantic example. IR contracts pass; remaining generated-code and GPU comparison against the pinned source stay open. |
+
+Actual CUTLASS and FlashInfer PTX/CUBIN and TIRx CUBIN were captured with the
+existing compiler under the socket lease. The CUTLASS artifact confirms elected
+leaders, the read-only producer-tail wait, and no extra GPU fence before the
+terminal communication barrier. No newer scoped-alias instructions or private
+publication/tuning prototypes are part of the faithful port.
+
+The restored GEMM source
+`ed1cb2cbb73d69762aa96df92c26eb7adb072435485001c84d7f760771ad6441`
+passed **114 matched-configuration comparisons per round**, with four leased
+GPUs, NVRTC 13.2.78, 100 graph launches, nine interleaved trials, and 0.5 s idle.
+All 228 rows match their pinned origin bitwise, satisfy the independent
+reference, and reset flags. The worst latency ratios over *every configuration*
+are **1.007424 / 1.006724** (first/repeat), below `1 / 0.99`. Selecting each
+origin's best configuration and using that **same configuration** for TIRx gives
+worst ratios **1.004910 / 1.002717**. No instruction upgrade, alternative
+publication protocol, launch fusion, or port-only retuning closes this gate.
+
 ## Current evidence
+
+The faithful two-shot all-reduce passes **18 shapes per round**, twice, on
+four socket-leased GPUs with the existing CUDA 13.2.78 toolchain. Worst latency
+ratios are **1.003703 / 1.003391**, below the unchanged `1 / 0.99` limit.
+Every comparison matches CUTLASS bitwise, passes its independent-reference
+precision check, and leaves all flags zero. No port-only instruction or
+algorithm change is used.
+
+The exact all-gather components and partial-CTA launch support pass **70
+focused CPU tests** on the supported Linux Python 3.13 environment. The Rust
+engine passes **888 unit tests, four checker-import tests, and three public
+surface tests**. Five partial-CTA GPU microtests pass under the socket lease.
+These results cover the actual one-thread helper kernels, without changing
+their launch geometry. Partial-CTA collectives remain explicitly unsupported.
+
+After the ABI update, **138 additional targeted tests pass** for the complete
+GEMM numerical/race/sync matrix, IR contracts, support-table generation, and
+benchmark evidence gates. The faithful all-gather GPU probe matches CUTLASS
+bitwise and measures 47.54 versus 47.55 microseconds at the same configuration;
+the full shape/configuration matrix and repeat are still running. Nine Mega
+MoE IR checks retain per-token serial chunks and distinguish baseline timeout,
+load, and fence forms from the separate strengthened example.
+
+The pinned DeepGEMM reference builds with its original kernels and submodules
+(`559d79f`, CUTLASS `f3fde583`, fmt `553ec11`). PyTorch 2.14 requires a C++20
+override for the host extension; CUDA/NVRTC remains 13.2.78 and the CUDA JIT
+instruction choices are unchanged. The benchmark separately checks output
+and cumulative statistics before timing and rejects stale build stamps.
 
 The October 10, 2026 handoff preserves the prior GB200 measurement tables and
 ports on upstream `66681fb`, including the `tirx_harness/` to `tools/` directory
@@ -82,18 +146,19 @@ run exposed the stale ABI header, now corrected; its other 16 failures require
 generated native modules that could not link CPython symbols on macOS. Those
 execution-dependent checks still need the supported Linux environment.
 
-The corrected `sys_fenced` GPU implementation is numerically bitwise-correct
+The separately strengthened `sys_fenced` GPU implementation is numerically bitwise-correct
 on the exercised probe shapes, but has **not** passed the 99% performance bar.
 Synchronization and pipeline optimizations remain in progress. The complete
 19-shape matrix and independent repeat are not yet validated for the final
-implementation. Preserve the original comparison kernels and the 99% threshold;
-neither historical `origin` ordering nor a faster unchecked prototype closes
-this gate. Every accepted timing must use only the GPUs actually assigned by
+implementation. Its slowdown is not a measurement of like-for-like IR overhead.
+For the port-fidelity gate, preserve the original comparison kernels and the
+99% threshold; neither historical data nor a differently optimized prototype
+closes it. Every accepted timing must use only the GPUs actually assigned by
 the socket lease; an override of that assignment invalidates the run.
 
 On October 13, a fresh four-rank GPU screen covered **all 19 declared shapes
 against both pinned origins: 38 shape/origin comparisons**, with one retained
-top configuration per pair. The unchanged committed `sys_fenced` builder
+top configuration per pair. Commit `b82113f`'s then-default `sys_fenced` builder
 matched each origin bitwise on every rank, satisfied the independent float64
 reference's output-rounding tolerance, and reset every flag. The kernel source
 SHA-256 was
@@ -121,7 +186,7 @@ rule-to-test references, documentation code-block syntax, and patch whitespace.
 Sphinx is not installed locally, so a rendered documentation build is also
 pending. None of these static checks substitutes for the native or GPU gates.
 
-An offline audit of the checked-in measurements found the following worst
+An offline audit of the historical measurements found the following worst
 latency ratios. A ratio is `TIRx latency / origin latency`; performance of at
 least 99% requires **ratio ≤ 1 / 0.99**, approximately 1.010101. “All shapes”
 means every entry in the corresponding benchmark module's `SHAPES`, with the
@@ -147,16 +212,15 @@ are historical reports; they have not been reproduced on this branch.
 
 ## Correctness limits to resolve
 
-- **Full-scale GEMM + all-reduce needs performance closure for the corrected default.**
-  The port now defaults to `ordering="sys_fenced"` for both origin schedules:
-  complete stores, system-scope release/acquire, and alias fences on the
-  publication path. Its direct NumSim/Racecheck/Synccheck tests pass in the
-  supported Linux environment and are separate from the older 499-pass result. `ordering="origin"`
-  remains an explicit negative control. The CPU correctness/checker matrix now
-  passes, but the GPU timing probes fail the 99% gate. Optimize the corrected
-  kernel, then measure the complete shape matrix against the original baselines.
-  Comparison rows record the ordering mode, and the gate
-  cannot reuse old signaling results.
+- **Full-scale GEMM + all-reduce now has faithful-port validation.** The default
+  is now `ordering="origin"`; preserve the source's operations instead of
+  compensating for overhead with new instructions or scheduling patterns.
+  The explicit `sys_fenced` examples have separate numerical/checker evidence.
+  Their clean verdicts do not establish the baseline's safety, and their
+  timings do not establish port fidelity. The restored port passes all 19
+  shapes, both origins, and the independent repeat as recorded above. Rows
+  identify ordering; the gate rejects unlabelled history, another mode's
+  measurements, or choosing a different port configuration to hide overhead.
 - **Mega MoE's provenance correction needs an end-to-end rerun.** The prior
   result was `review` for one `alias_stale_read` advisory. Focused Rust
   regressions now verify invalidation of overwritten named provenance,

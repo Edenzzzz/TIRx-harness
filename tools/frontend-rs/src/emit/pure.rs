@@ -974,7 +974,7 @@ impl<'a> Emitter<'a> {
             "cluster_nctaid.x" => Some("ctx.topology().ctas_per_cluster()".to_owned()),
             "cluster_ctarank" => Some("ctx.cta_id_in_cluster()".to_owned()),
             "cluster_nctarank" => Some("ctx.topology().ctas_per_cluster()".to_owned()),
-            "ntid.x" => Some("ctx.topology().warps_per_cta() * WARP_SIZE".to_owned()),
+            "ntid.x" => Some("ctx.topology().threads_per_cta()".to_owned()),
             _ => None,
         };
         if ZERO.contains(&register_name) || ONE.contains(&register_name) {
@@ -1156,6 +1156,7 @@ impl<'a> Emitter<'a> {
         result_type: &str,
         mode: &str,
     ) -> AResult<RustValue> {
+        self.require_whole_warps("warp shuffle")?;
         let args = call_args(expr);
         if args.len() != 4 && args.len() != 5 {
             return unsupported(format!(
@@ -1489,6 +1490,7 @@ impl<'a> Emitter<'a> {
         operation: &str,
         width: i64,
     ) -> AResult<RustValue> {
+        self.require_whole_warps("warp reduction")?;
         let args = call_args(expr);
         let value = self.emit_expr(&args[0])?;
         let value = self.as_warp_value(value);
@@ -1828,6 +1830,7 @@ impl<'a> Emitter<'a> {
         operation: &str,
         num_warps: i64,
     ) -> AResult<RustValue> {
+        self.require_whole_warps("CTA reduction")?;
         let source_op_id = self.static_op_id(expr)?;
         let args = call_args(expr);
         let value = self.emit_expr(&args[0])?;
@@ -2143,6 +2146,7 @@ pub fn cuda_cta_reduce(emitter: &mut Emitter, call: &Decoded) -> AResult<Option<
         .map(Some)
 }
 pub fn cuda_elect_sync(emitter: &mut Emitter, call: &Decoded) -> AResult<Option<RustValue>> {
+    emitter.require_whole_warps(&call.op_name)?;
     let signature = signature(call.node, call.call)?;
     check_signature(
         &signature,
@@ -2725,6 +2729,7 @@ pub fn cuda_uint_as_float(emitter: &mut Emitter, call: &Decoded) -> AResult<Opti
         .map(Some)
 }
 pub fn cuda_warp_reduce(emitter: &mut Emitter, call: &Decoded) -> AResult<Option<RustValue>> {
+    emitter.require_whole_warps(&call.op_name)?;
     let signature = signature(call.node, call.call)?;
     check_signature(
         &signature,

@@ -40,8 +40,8 @@ def two_shot_all_reduce(tiles: int, world: int, n_tiles: int = 1):
         seen = T.alloc_local((1,), "int32")
         tile = rank * ctas + cta
         col = tile // tiles * TILE + lane * 4
-        for i in T.serial(32):
-            row = tile % tiles * TILE + warp + 4 * i
+        for iteration in T.unroll(32):
+            row = tile % tiles * TILE + warp + 4 * iteration
             T.ptx.multimem_ld_reduce.weak.global_.add.v4.f32(
                 v[0], v[1], v[2], v[3], in_mc.ptr_to([row, col]))
             T.ptx.multimem_st.weak.global_.v4.f32(

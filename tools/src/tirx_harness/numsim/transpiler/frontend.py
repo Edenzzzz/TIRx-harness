@@ -40,6 +40,7 @@ class LaunchTopology:
     ctas_per_cluster: int
     warps_per_cta: int
     warps_per_warpgroup: int
+    threads_per_cta: int
 
     @property
     def warp_count(self) -> int:

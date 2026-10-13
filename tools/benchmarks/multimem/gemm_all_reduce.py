@@ -9,8 +9,9 @@
 appends one JSON line per candidate to ``--log``; it resumes from the log, and a
 candidate that hangs or faults the GPU is recorded as failed. ``compare`` takes
 each origin's ``TOP`` fastest correct configurations, times them interleaved with
-TIRx on the same configurations, and reports each origin's best against TIRx's
-best.
+TIRx on the same configurations, and reports both at the origin's best
+configuration. Comparisons default to the baseline-faithful ``origin`` ordering;
+``--ordering sys_fenced`` measures a separate strengthened semantic example.
 
 C = A @ B^T with K-major A (M x K) and B (N x K) and row-major C; every rank holds
 its own A and B, and the kernel leaves sum over ranks of C on every rank.
@@ -183,9 +184,9 @@ def rounding_error(output, reference):
 
 
 def tirx_launchers(rank: int, world: int, shape: dict, config: dict, protocol: str,
-                   workspace: list[dict], shared: dict):
+                   workspace: list[dict], shared: dict, ordering: str = "origin"):
     """One launch closure per workspace of TIRx ``gemm_all_reduce`` built with
-    ``config`` and data placement of that origin, with system-scope ordering."""
+    ``config`` and data placement of that origin, with the requested ordering."""
 
     import torch
     from tirx_kernels.runner import compile_kernel
@@ -199,6 +200,7 @@ def tirx_launchers(rank: int, world: int, shape: dict, config: dict, protocol: s
         use_2cta=config["use_2cta"], mma_tiler=tuple(config["mma_tiler"]),
         cluster=tuple(cluster), use_tma_store=config["use_tma_store"],
         raster=config.get("raster", "m"), swizzle=config.get("swizzle", 1), protocol=protocol,
+        ordering=ordering,
         max_active_clusters=origins.max_active_clusters(cluster[0] * cluster[1]),
         flag_len=shared["flag"].numel())
     executable = compile_kernel(kernel.func)
@@ -379,7 +381,7 @@ def best_configs(log: Path, origin: str, shape_name: str, top: int = TOP) -> lis
 
 
 def compare_rank(rank: int, world: int, shape_name: str, entries: list[dict],
-                 idle_s: float = 0.0) -> list[dict]:
+                 idle_s: float = 0.0, ordering: str = "origin") -> list[dict]:
     """Check and time each ``{"origin", "config"}`` entry's origin kernel and
     TIRx kernel, interleaved, on the same buffers (``idle_s``: see
     ``common.time_launches``)."""
@@ -399,7 +401,7 @@ def compare_rank(rank: int, world: int, shape_name: str, entries: list[dict],
         impls = {
             "origin": origins.gemm_all_reduce_launchers(
                 origin, rank, world, shape, config, workspace, shared),
-            "tirx": tirx_launchers(rank, world, shape, config, origin, workspace, shared),
+            "tirx": tirx_launchers(rank, world, shape, config, origin, workspace, shared, ordering),
         }
         errors, outputs = {}, {}
         for name, closures in impls.items():
@@ -408,7 +410,7 @@ def compare_rank(rank: int, world: int, shape_name: str, entries: list[dict],
                             dtype=torch.int32)
         dist.all_reduce(same, op=dist.ReduceOp.MIN)
         row = {"shape": shape_name, "origin": origin, "config": config_key(config),
-               "tirx_ordering": "sys_fenced",
+               "tirx_ordering": ordering,
                "origin_error": errors["origin"], "tirx_error": errors["tirx"],
                "bitwise_equal": bool(int(same))}
         if errors["origin"] is None and errors["tirx"] is None:
@@ -424,13 +426,13 @@ def compare_rank(rank: int, world: int, shape_name: str, entries: list[dict],
     return rows
 
 
-def summarize(rows: list[dict], *, ordering: str = "sys_fenced") -> list[dict]:
-    """Per shape and origin: the origin's best time over its configurations
-    against TIRx's best over the same configurations. A configuration's latest
-    row replaces its earlier ones. Legacy rows have origin ordering and are
-    excluded from the system-ordered result unless explicitly requested."""
+def summarize(rows: list[dict], *, ordering: str = "origin") -> list[dict]:
+    """Per shape and origin: compare both at the origin's best configuration.
+    Switching the port to a different configuration cannot hide overhead. A configuration's latest
+    row replaces its earlier ones. Rows must identify the measured ordering;
+    missing or different modes cannot validate this comparison."""
 
-    rows = [row for row in rows if row.get("tirx_ordering", "origin") == ordering]
+    rows = [row for row in rows if row.get("tirx_ordering") == ordering]
     rows = list({(r["shape"], r["origin"], r["config"]): r for r in rows}.values())
     summary = []
     for shape in SHAPES:
@@ -441,14 +443,14 @@ def summarize(rows: list[dict], *, ordering: str = "sys_fenced") -> list[dict]:
             timed = [r for r in group if "ratio" in r]
             row = {"shape": shape["name"], "M": shape["m"], "N": shape["n"], "K": shape["k"],
                    "types": f"{shape['ab']}->{shape['c']}", "origin": origin,
+                   "tirx_ordering": ordering,
                    "configs": len(group), "correct": len(timed) == len(group),
                    "bitwise_equal": all(r["bitwise_equal"] for r in group)}
             if timed:
                 best_origin = min(timed, key=lambda r: r["origin_us"])
-                best_tirx = min(timed, key=lambda r: r["tirx_us"])
                 row.update(origin_us=best_origin["origin_us"], origin_config=best_origin["config"],
-                           tirx_us=best_tirx["tirx_us"], tirx_config=best_tirx["config"],
-                           ratio=best_tirx["tirx_us"] / best_origin["origin_us"])
+                           tirx_us=best_origin["tirx_us"], tirx_config=best_origin["config"],
+                           ratio=best_origin["tirx_us"] / best_origin["origin_us"])
             summary.append(row)
     return summary
 
@@ -475,7 +477,7 @@ def validate_summary(summary: list[dict], shapes: list[str], origins: list[str])
 
 
 def compare(origins_: list[str], shapes: list[str], world: int, log: Path, out: Path,
-            top: int, idle_s: float = 0.0) -> None:
+            top: int, idle_s: float = 0.0, ordering: str = "origin") -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     completed_rows = []
     for shape_name in shapes:
@@ -485,12 +487,13 @@ def compare(origins_: list[str], shapes: list[str], world: int, log: Path, out: 
             print(f"[compare] {shape_name}: no tuned configurations", flush=True)
             continue
         rows = common.spawn("benchmarks.multimem.gemm_all_reduce:compare_rank", world,
-                            shape_name, entries, idle_s)
+                            shape_name, entries, idle_s, ordering)
         completed_rows.extend(rows)
         with open(out, "a") as f:
             for row in rows:
                 f.write(json.dumps({**row, "time": round(time.time(), 1)}) + "\n")
-    summary = summarize(completed_rows)
+    summary = summarize(completed_rows, ordering=ordering)
+    print(f"Ordering: {ordering}")
     print(common.table([r for r in summary if "ratio" in r], [
         ("shape", "shape", "s"), ("types", "types", "s"), ("origin", "origin", "s"),
         ("origin_us", "origin (us)", ".2f"), ("tirx_us", "TIRx (us)", ".2f"),
@@ -513,13 +516,18 @@ def main() -> None:
         mode.add_argument("--log", type=Path, default=RESULTS / "gemm_all_reduce_tuning.jsonl")
     sub.choices["compare"].add_argument("--top", type=int, default=TOP)
     sub.choices["compare"].add_argument(
-        "--out", type=Path, default=RESULTS / "gemm_all_reduce_sys_fenced.jsonl")
+        "--ordering", choices=("origin", "sys_fenced"), default="origin",
+        help="baseline-faithful port, or a separately strengthened semantic example")
+    sub.choices["compare"].add_argument(
+        "--out", type=Path, default=None)
     sub.choices["compare"].add_argument("--idle-s", type=float, default=0.0)
     args = parser.parse_args()
     if args.mode == "tune":
         tune(args.origins, args.shapes, args.world, args.log)
     else:
-        compare(args.origins, args.shapes, args.world, args.log, args.out, args.top, args.idle_s)
+        output = args.out or RESULTS / f"gemm_all_reduce_{args.ordering}.jsonl"
+        compare(args.origins, args.shapes, args.world, args.log, output, args.top, args.idle_s,
+                args.ordering)
 
 
 if __name__ == "__main__":

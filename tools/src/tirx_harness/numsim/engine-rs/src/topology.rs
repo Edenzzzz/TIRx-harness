@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::ops::Range;
 
-use crate::WarpContext;
+use crate::{WarpContext, WarpMask, WARP_SIZE};
 
 /// Current engine limit, matching CUDA's 1024-thread CTA limit for 32-lane warps.
 pub const MAX_WARPS_PER_CTA: usize = 32;
@@ -24,6 +24,7 @@ pub struct LaunchTopology {
     clusters: usize,
     ctas_per_cluster: usize,
     warps_per_cta: usize,
+    threads_per_cta: usize,
     warp_count: usize,
     ranks: usize,
 }
@@ -65,6 +66,7 @@ impl LaunchTopology {
             clusters,
             ctas_per_cluster,
             warps_per_cta,
+            threads_per_cta: warps_per_cta * WARP_SIZE,
             warp_count,
             ranks: 1,
         })
@@ -143,6 +145,32 @@ impl LaunchTopology {
         self.warps_per_cta
     }
 
+    pub fn with_cta_threads(mut self, threads: usize) -> Result<Self, TopologyError> {
+        if threads == 0 || threads.div_ceil(WARP_SIZE) != self.warps_per_cta {
+            return Err(TopologyError::ThreadCountMismatch {
+                threads,
+                warps: self.warps_per_cta,
+            });
+        }
+        self.threads_per_cta = threads;
+        Ok(self)
+    }
+
+    pub const fn threads_per_cta(self) -> usize {
+        self.threads_per_cta
+    }
+
+    pub const fn launched_lanes(self, warp_id_in_cta: usize) -> WarpMask {
+        let remaining = self
+            .threads_per_cta
+            .saturating_sub(warp_id_in_cta * WARP_SIZE);
+        if remaining >= WARP_SIZE {
+            WarpMask::FULL
+        } else {
+            WarpMask::from_bits((1_u32 << remaining) - 1)
+        }
+    }
+
     pub const fn cta_count(self) -> usize {
         self.clusters * self.ctas_per_cluster
     }
@@ -177,6 +205,10 @@ impl LaunchTopology {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TopologyError {
+    ThreadCountMismatch {
+        threads: usize,
+        warps: usize,
+    },
     ZeroDimension {
         name: &'static str,
     },
@@ -191,6 +223,10 @@ pub enum TopologyError {
 impl fmt::Display for TopologyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ThreadCountMismatch { threads, warps } => write!(
+                f,
+                "CTA thread count {threads} does not occupy exactly {warps} warps"
+            ),
             Self::ZeroDimension { name } => write!(f, "launch dimension {name} must be non-zero"),
             Self::DimensionTooLarge {
                 name,
@@ -210,6 +246,32 @@ impl Error for TopologyError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_ctas_preserve_only_launched_lanes_on_every_rank() {
+        for threads in [1_usize, 17, 31, 32, 33, 63, 1023, 1024] {
+            let topology = LaunchTopology::with_ranks(2, 2, threads.div_ceil(WARP_SIZE), 4)
+                .unwrap()
+                .with_cta_threads(threads)
+                .unwrap();
+            assert_eq!(topology.rank_local().threads_per_cta(), threads);
+            for context in topology.warp_contexts() {
+                let base = context.warp_id_in_cta() * WARP_SIZE;
+                assert_eq!(context.active_mask().len(), (threads - base).min(WARP_SIZE));
+                for lane in 0..WARP_SIZE {
+                    assert_eq!(context.active_mask().contains(lane), base + lane < threads);
+                }
+                assert_eq!(
+                    context.with_active_mask(WarpMask::FULL).active_mask(),
+                    context.active_mask()
+                );
+            }
+        }
+        let topology = LaunchTopology::new(1, 1, 2).unwrap();
+        for threads in [0, 1, 32, 65, usize::MAX] {
+            assert!(topology.with_cta_threads(threads).is_err());
+        }
+    }
 
     #[test]
     fn contexts_have_stable_linear_coordinates() {

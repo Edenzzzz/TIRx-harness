@@ -6,6 +6,7 @@ import ast
 
 import pytest
 
+from ported.cutlass.sm100_all_reduce import two_shot_all_reduce
 from ported.cutlass.sm100_gemm_all_reduce import gemm_all_reduce
 from tirx_harness.numsim.transpiler.host_prelude import normalize_host_tensor_map_prelude
 
@@ -47,8 +48,8 @@ def _modifiers(function, instruction):
 @pytest.mark.parametrize("use_tma_store", (True, False))
 @pytest.mark.parametrize("use_2cta", (True, False))
 @pytest.mark.parametrize("rank", (None, 0))
-def test_full_kernel_defaults_to_system_publication(protocol, use_tma_store, use_2cta, rank):
-    function = _kernel(protocol, use_tma_store, use_2cta, rank)
+def test_full_kernel_system_publication_is_explicit(protocol, use_tma_store, use_2cta, rank):
+    function = _kernel(protocol, use_tma_store, use_2cta, rank, ordering="sys_fenced")
     arrivals = _modifiers(function, "multimem_red")
     polls = _modifiers(function, "atom")
 
@@ -61,11 +62,66 @@ def test_full_kernel_defaults_to_system_publication(protocol, use_tma_store, use
 
 
 @pytest.mark.parametrize("protocol", ("cutlass", "flashinfer"))
-def test_origin_ordering_requires_explicit_opt_in(protocol):
-    function = _kernel(protocol, True, False, None, ordering="origin")
+@pytest.mark.parametrize("use_tma_store", (True, False))
+def test_full_kernel_defaults_to_baseline_ordering(protocol, use_tma_store):
+    function = _kernel(protocol, use_tma_store, False, None)
 
     assert any(modifiers[1] == "gpu" for modifiers in _modifiers(function, "multimem_red"))
     assert any(modifiers[1] == "gpu" for modifiers in _modifiers(function, "atom"))
+    if protocol == "cutlass":
+        assert not any(
+            modifiers[:2] == ("acq_rel", "gpu")
+            for modifiers in _modifiers(function, "fence")
+        )
+        assert ("proxy", "alias", "", "") not in _modifiers(function, "fence")
+
+
+@pytest.mark.parametrize("protocol", ("cutlass", "flashinfer"))
+@pytest.mark.parametrize("use_tma_store", (True, False))
+def test_baseline_flag_operations_use_elected_leaders(protocol, use_tma_store):
+    faithful = _kernel(protocol, use_tma_store, False, None)
+    strengthened = _kernel(protocol, use_tma_store, False, None, ordering="sys_fenced")
+
+    assert len(_modifiers(faithful, "elect_sync")) - len(
+        _modifiers(strengthened, "elect_sync")
+    ) == (4 if use_tma_store else 3)
+
+
+@pytest.mark.parametrize("protocol", ("cutlass", "flashinfer"))
+@pytest.mark.parametrize("use_2cta", (True, False))
+def test_baseline_bulk_store_waits_are_not_silently_strengthened(protocol, use_2cta):
+    function = _kernel(protocol, True, use_2cta, None)
+    waits = [
+        modifiers for modifiers in _modifiers(function, "cp")
+        if modifiers[:3] == ("async", "bulk", "wait_group")
+    ]
+
+    assert waits
+    if protocol == "cutlass":
+        assert all(modifiers[3] == "read" for modifiers in waits)
+    else:
+        assert any(modifiers[3] == "" for modifiers in waits)
+
+
+def test_two_shot_matches_the_baseline_constexpr_loop():
+    tree = ast.parse(two_shot_all_reduce(8, 4, 2).script())
+    unrolled = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.For) and isinstance(node.iter, ast.Call)
+        and ast.unparse(node.iter.func) == "T.unroll"
+    ]
+
+    assert len(unrolled) == 1
+    assert ast.literal_eval(unrolled[0].iter.args[-1]) == 32
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_two_shot_preserves_the_baseline_constexpr_rank(rank):
+    function = two_shot_all_reduce(8, 4, 2)
+    specialized = function.specialize({function.params[0]: rank})
+    assert [str(parameter.name) for parameter in specialized.params] == [
+        "data_in", "data_out", "in_mc", "out_mc", "flag", "flag_mc",
+    ]
 
 
 def test_unknown_ordering_is_rejected():

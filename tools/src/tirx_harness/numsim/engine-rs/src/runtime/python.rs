@@ -1683,7 +1683,7 @@ pub fn build_artifact_metadata_with_build_identity(
     engine_hash: &str,
     build_identity_json: &str,
     kernel_names: &[&str],
-    topology_dimensions: &[(usize, usize, usize)],
+    topology_dimensions: &[(usize, usize, usize, usize)],
 ) -> PyResult<Py<PyAny>> {
     if abi_version != NUMSIM_ABI_VERSION {
         return Err(PyValueError::new_err(format!(
@@ -1701,8 +1701,9 @@ pub fn build_artifact_metadata_with_build_identity(
     let topologies = PyList::empty(py);
     let mut warp_counts = Vec::with_capacity(topology_dimensions.len());
     let mut total_warp_count = 0_usize;
-    for &(clusters, ctas_per_cluster, warps_per_cta) in topology_dimensions {
+    for &(clusters, ctas_per_cluster, warps_per_cta, threads_per_cta) in topology_dimensions {
         let topology = LaunchTopology::new(clusters, ctas_per_cluster, warps_per_cta)
+            .and_then(|topology| topology.with_cta_threads(threads_per_cta))
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         warp_counts.push(topology.warp_count());
         total_warp_count = total_warp_count
@@ -1713,6 +1714,7 @@ pub fn build_artifact_metadata_with_build_identity(
         value.set_item("clusters", clusters)?;
         value.set_item("ctas_per_cluster", ctas_per_cluster)?;
         value.set_item("warps_per_cta", warps_per_cta)?;
+        value.set_item("threads_per_cta", threads_per_cta)?;
         topologies.append(value)?;
     }
 
@@ -1883,7 +1885,7 @@ mod tests {
                 "engine-digest",
                 r#"{"engine_hash":"engine-digest"}"#,
                 &["first", "second"],
-                &[(1, 1, 2), (2, 1, 3)],
+                &[(1, 1, 2, 33), (2, 1, 3, 96)],
             )
             .unwrap();
             let metadata = metadata.bind(py);
@@ -1924,7 +1926,7 @@ mod tests {
                 "engine-digest",
                 r#"{"engine_hash":"engine-digest","nested":{"target":"test"}}"#,
                 &["kernel"],
-                &[(1, 1, 1)],
+                &[(1, 1, 1, 32)],
             )
             .unwrap();
             let metadata = metadata.bind(py);
@@ -1963,7 +1965,7 @@ mod tests {
                 "engine-digest",
                 r#"{"engine_hash":"other"}"#,
                 &["kernel"],
-                &[(1, 1, 1)],
+                &[(1, 1, 1, 32)],
             )
             .unwrap_err();
             assert!(mismatch

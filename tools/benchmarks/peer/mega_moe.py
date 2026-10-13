@@ -36,6 +36,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import math
 import statistics
 import subprocess
 import sys
@@ -174,6 +175,7 @@ def compare(shapes: list[str], cache: Path, out: Path, rounds: int) -> None:
     os.environ[NUM_SMS_ENV] = str(num_sms)
     out.parent.mkdir(parents=True, exist_ok=True)
     digest = source_digest()
+    completed = []
     for name in shapes:
         shape = SHAPES_BY_NAME[name]
         paths = libraries(shape, cache, num_sms)
@@ -182,13 +184,20 @@ def compare(shapes: list[str], cache: Path, out: Path, rounds: int) -> None:
             raise FileNotFoundError(f"run `prepare` first: {missing}")
         stamp = _source_stamp(shape, cache, num_sms)
         built_from = stamp.read_text().strip() if stamp.exists() else None
-        if built_from is not None and built_from != digest:
+        if built_from != digest:
             raise RuntimeError(f"{name} was built from other sources; run `prepare` again")
         for stats, path in paths.items():
             os.environ[_PREPARED_LIBRARY_ENV[stats]] = str(path)
+        correctness = _run_distributed(config(shape), "test")
+        if (correctness.get("status") != "OK"
+                or correctness.get("deepgemm_max_abs_diff") != 0
+                or correctness.get("stats_max_abs_diff") != 0):
+            raise RuntimeError(f"{name}: output/statistics comparison failed: {correctness}")
         result = _run_distributed(config(shape), "bench", rounds=rounds, cooldown_s=1.0)
         samples = result["round_samples"]
         row = {"shape": name, "run": round(time.time(), 1), "num_sms": num_sms,
+               "comparison_kind": "port_fidelity", "ordering": "origin",
+               "stats_max_abs_diff": correctness["stats_max_abs_diff"],
                "source": built_from,
                "config": {k: v for k, v in shape.items() if k != "name"},
                "tirx_us": statistics.median(samples["tirx"]),
@@ -203,13 +212,32 @@ def compare(shapes: list[str], cache: Path, out: Path, rounds: int) -> None:
         print(json.dumps(row), flush=True)
         with open(out, "a") as f:
             f.write(json.dumps(row) + "\n")
-    print(summary(_lines(out)))
+        completed.append(row)
+    print(summary(completed))
+    validate_rows(completed, shapes, digest)
+
+
+def validate_rows(rows, shapes, source):
+    latest = {row["shape"]: row for row in rows
+              if row.get("comparison_kind") == "port_fidelity"
+              and row.get("ordering") == "origin" and row.get("source") == source}
+    failures = []
+    for shape in shapes:
+        row = latest.get(shape)
+        ratio = row.get("ratio", math.inf) if row else math.inf
+        if (not row or row.get("max_abs_diff") != 0 or row.get("stats_max_abs_diff") != 0
+                or not math.isfinite(ratio) or ratio <= 0 or ratio > 1 / 0.99):
+            failures.append(shape)
+    if not shapes or failures:
+        raise RuntimeError("Mega MoE fidelity validation failed: " + ", ".join(failures))
 
 
 def summary(rows: list[dict]) -> str:
     """The latest run of each shape: DeepGEMM's and TIRx's times."""
     latest = {}
     for row in rows:
+        if row.get("comparison_kind") != "port_fidelity" or row.get("ordering") != "origin":
+            continue
         if row["shape"] not in latest or row["run"] > latest[row["shape"]]["run"]:
             latest[row["shape"]] = row
     table = []
@@ -238,7 +266,7 @@ def main() -> None:
                                         help="SM count to compile for (default: GPU 0's)")
     sub.choices["compare"].add_argument("--rounds", type=int, default=ROUNDS)
     sub.choices["compare"].add_argument("--out", type=Path,
-                                        default=RESULTS / "mega_moe_gb200x4.jsonl")
+                                        default=RESULTS / "mega_moe_fidelity.jsonl")
     args = parser.parse_args()
     if args.mode == "prepare":
         prepare(args.shapes, args.cache, args.jobs, args.num_sms or device_num_sms())

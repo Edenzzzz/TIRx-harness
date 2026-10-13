@@ -321,6 +321,15 @@ pub struct Emitter<'a> {
 }
 
 impl<'a> Emitter<'a> {
+    pub fn require_whole_warps(&self, operation: &str) -> AResult<()> {
+        if self.plan.topology.threads_per_cta % 32 != 0 {
+            return unsupported(format!(
+                "{operation} is not yet modeled for partial-warp CTA launches"
+            ));
+        }
+        Ok(())
+    }
+
     /// An emitter for plain (uninstrumented, analysis-free) emission.
     pub fn new(
         ctx: &'a Ctx<'a>,

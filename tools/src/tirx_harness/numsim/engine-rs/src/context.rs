@@ -55,7 +55,7 @@ impl WarpContext {
             cluster_id,
             cta_id_in_cluster,
             warp_id_in_cta,
-            active_mask: WarpMask::FULL,
+            active_mask: topology.launched_lanes(warp_id_in_cta),
             control_provenance: ControlProvenance::None,
         }
     }
@@ -109,11 +109,13 @@ impl WarpContext {
     }
 
     pub fn set_active_mask(&mut self, active_mask: WarpMask) {
-        self.active_mask = active_mask;
+        self.active_mask =
+            active_mask.intersection(self.topology.launched_lanes(self.warp_id_in_cta));
     }
 
     pub const fn with_active_mask(mut self, active_mask: WarpMask) -> Self {
-        self.active_mask = active_mask;
+        self.active_mask =
+            active_mask.intersection(self.topology.launched_lanes(self.warp_id_in_cta));
         self
     }
 
@@ -136,7 +138,8 @@ impl WarpContext {
         entry_mask: WarpMask,
         branch_mask: WarpMask,
     ) -> Self {
-        self.active_mask = branch_mask;
+        self.active_mask =
+            branch_mask.intersection(self.topology.launched_lanes(self.warp_id_in_cta));
         self.control_provenance = self
             .control_provenance
             .enter_elect_sync(entry_mask, branch_mask);

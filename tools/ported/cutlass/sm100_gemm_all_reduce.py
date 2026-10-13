@@ -29,16 +29,13 @@ selects the origin's schedule and data placement:
   4..1 giving every thread whole 128-bit accesses, and four ``ld_reduce`` in
   flight per thread.
 * ``flashinfer``: the reduced tile is written back to ``c_mc`` (in place),
-  four all-reduce warps, and
-  each ``ld_reduce`` followed by its ``st``. FlashInfer's direct-store epilogue
-  arrives from warp 0 without first synchronizing the other epilogue warps'
-  stores; this port joins the four warps before the arrive.
+  four all-reduce warps, and each ``ld_reduce`` followed by its ``st``.
 
-Both schedules default to ``ordering="sys_fenced"``: the epilogue completes
-its stores, bridges the multicast alias and releases a system-scope arrival;
-the all-reduce warps acquire at system scope and bridge the alias before
-reading. ``ordering="origin"`` preserves the origins' GPU-scoped/relaxed
-signaling for explicit counterexamples and historical comparisons only.
+Both schedules default to ``ordering="origin"``, preserving the baseline's
+instructions and synchronization, including its known checker findings.
+``ordering="sys_fenced"`` is a separate, strengthened semantic example: it
+completes stores, joins direct-store writers, bridges the multicast alias,
+and uses system-scope publication. It is not a like-for-like performance port.
 Both end with an SM-wise system-scope release/acquire barrier.
 """
 
@@ -259,7 +256,7 @@ def _descriptor_lo(address):
 @functools.cache
 def gemm_all_reduce(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster,
                     use_tma_store, raster="m", swizzle=1, protocol="cutlass",
-                    ordering="sys_fenced", max_active_clusters, flag_len):
+                    ordering="origin", max_active_clusters, flag_len):
     """Build the kernel for one rank; returns a ``txl.Kernel``.
 
     Parameters, all byte buffers but the flags: ``a`` (m x k), ``b`` (n x k),
@@ -671,7 +668,7 @@ def gemm_all_reduce(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
                     txl.ptx[f"tcgen05.ld.sync.aligned.32x32b.x{sub_cols}.b32"](
                         *[values[i] for i in range(sub_cols)], taddr)
                     txl.ptx["tcgen05.wait::ld.sync.aligned"]()
-                    if not use_tma_store:
+                    if not use_tma_store and protocol == "cutlass":
                         with txl.If(subtile == subtiles - 1), txl.Then():
                             txl.ptx["tcgen05.fence::before_thread_sync"]()
                             with txl.If(_elected()), txl.Then():
@@ -717,19 +714,24 @@ def gemm_all_reduce(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
                         stores_when_active(stage_chunks)
                         txl.ptx.fence.proxy.async_.shared__cta()
                         txl.ptx.bar.sync(txl.uint32(1), txl.uint32(128))
-                        with txl.If((warp == 0) & (lane == 0)), txl.Then():
-                            for block in range(blocks):
-                                if layout == "split_n":
-                                    col = tile_n * cta_n + block * (cta_n // 2) + subtile * 32
-                                else:
-                                    col = tile_n * cta_n + subtile * sub_cols + block * block_cols
-                                txl.ptx["cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"](
-                                    txl.address_of(c_map), txl.cast(col, "int32"),
-                                    txl.cast(tile_m * cta_m, "int32"), txl.int32(0),
-                                    smem.ptr_to([c_offset + c_buffer * p.c_stage_bytes
-                                                 + block * block_bytes]))
-                            txl.ptx.cp.async_.bulk.commit_group()
-                            txl.ptx.cp.async_.bulk.wait_group.read(c_stages - 1)
+                        with txl.If(warp == 0), txl.Then():
+                            with txl.If((lane == 0) if system_ordered else _elected()), txl.Then():
+                                for block in range(blocks):
+                                    if layout == "split_n":
+                                        col = tile_n * cta_n + block * (cta_n // 2) + subtile * 32
+                                    else:
+                                        col = tile_n * cta_n + subtile * sub_cols + block * block_cols
+                                    txl.ptx["cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"](
+                                        txl.address_of(c_map), txl.cast(col, "int32"),
+                                        txl.cast(tile_m * cta_m, "int32"), txl.int32(0),
+                                        smem.ptr_to([c_offset + c_buffer * p.c_stage_bytes
+                                                     + block * block_bytes]))
+                                if system_ordered:
+                                    txl.ptx.cp.async_.bulk.commit_group()
+                                    txl.ptx.cp.async_.bulk.wait_group.read(c_stages - 1)
+                            if not system_ordered:
+                                txl.ptx.cp.async_.bulk.commit_group()
+                                txl.ptx.cp.async_.bulk.wait_group.read(c_stages - 1)
                         txl.ptx.bar.sync(txl.uint32(1), txl.uint32(128))
                         txl.assign(c_buffer, c_buffer + 1)
                         with txl.If(c_buffer == c_stages), txl.Then():
@@ -743,8 +745,8 @@ def gemm_all_reduce(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
                                     c.ptr_to([offset]), *[words[chunk * 4 + i] for i in range(4)])
 
                         stores_when_active(store_chunks)
-                if use_tma_store:
-                    if protocol == "cutlass":
+                if use_tma_store or protocol == "flashinfer":
+                    if use_tma_store and protocol == "cutlass":
                         txl.ptx.bar.sync(txl.uint32(1), txl.uint32(128))
                     txl.ptx["tcgen05.fence::before_thread_sync"]()
                     with txl.If(_elected()), txl.Then():
@@ -754,25 +756,30 @@ def gemm_all_reduce(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
                         else:
                             txl.ptx.mbarrier.arrive.shared.b64(
                                 acc_pipe.empty.ptr_to([acc_state.stage]), txl.uint32(1))
-                else:
+                if not use_tma_store and (system_ordered or protocol == "cutlass"):
                     txl.ptx.bar.sync(txl.uint32(1), txl.uint32(128))
                 acc_state.advance()
                 index = flag_index(work, tile_m, tile_n)
-                with txl.If((warp == 0) & (lane == 0)), txl.Then():
-                    if use_tma_store:
+                if not system_ordered and protocol == "cutlass" and use_tma_store:
+                    txl.ptx.cp.async_.bulk.wait_group.read(0)
+                with txl.If(warp == 0), txl.Then():
+                    if not system_ordered and protocol == "flashinfer":
                         txl.ptx.cp.async_.bulk.wait_group(0)
-                    if system_ordered:
-                        txl.ptx.fence.proxy.alias()
-                        txl.ptx.multimem_red.release.sys.global_.add.s32(
-                            flag_mc.ptr_to([index]), txl.int32(1))
-                    elif protocol == "cutlass":
-                        txl.ptx.multimem_red.release.gpu.global_.add.s32(
-                            flag_mc.ptr_to([index]), txl.int32(1))
-                    else:
-                        txl.ptx.fence.acq_rel.gpu()
-                        txl.ptx.multimem_red.relaxed.gpu.global_.add.s32(
-                            flag_mc.ptr_to([index]), txl.int32(1))
-                        txl.ptx.fence.proxy.alias()
+                    with txl.If((lane == 0) if system_ordered else _elected()), txl.Then():
+                        if system_ordered:
+                            if use_tma_store:
+                                txl.ptx.cp.async_.bulk.wait_group(0)
+                            txl.ptx.fence.proxy.alias()
+                            txl.ptx.multimem_red.release.sys.global_.add.s32(
+                                flag_mc.ptr_to([index]), txl.int32(1))
+                        elif protocol == "cutlass":
+                            txl.ptx.multimem_red.release.gpu.global_.add.s32(
+                                flag_mc.ptr_to([index]), txl.int32(1))
+                        else:
+                            txl.ptx.fence.acq_rel.gpu()
+                            txl.ptx.multimem_red.relaxed.gpu.global_.add.s32(
+                                flag_mc.ptr_to([index]), txl.int32(1))
+                            txl.ptx.fence.proxy.alias()
                 next_work(work)
 
             with txl.If(warp == 0), txl.Then():
@@ -827,18 +834,19 @@ def gemm_all_reduce(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
             with txl.While(work < p.cluster_work):
                 tile_m, tile_n = tile_of(work)
                 index = flag_index(work, tile_m, tile_n)
-                with txl.If((warp == 6) & (lane == 0)), txl.Then():
-                    txl.assign(seen, 0)
-                    with txl.While(seen != world):
-                        if system_ordered:
-                            txl.ptx.atom.acquire.sys.global_.cas.b32(
-                                seen, flag.ptr_to([index]), txl.int32(world), txl.int32(0))
-                        elif protocol == "cutlass":
-                            txl.ptx.atom.acquire.gpu.global_.cas.b32(
-                                seen, flag.ptr_to([index]), txl.int32(world), txl.int32(0))
-                        else:
-                            txl.ptx.atom.relaxed.gpu.global_.cas.b32(
-                                seen, flag.ptr_to([index]), txl.int32(world), txl.int32(0))
+                with txl.If(warp == 6), txl.Then():
+                    with txl.If((lane == 0) if system_ordered else _elected()), txl.Then():
+                        txl.assign(seen, 0)
+                        with txl.While(seen != world):
+                            if system_ordered:
+                                txl.ptx.atom.acquire.sys.global_.cas.b32(
+                                    seen, flag.ptr_to([index]), txl.int32(world), txl.int32(0))
+                            elif protocol == "cutlass":
+                                txl.ptx.atom.acquire.gpu.global_.cas.b32(
+                                    seen, flag.ptr_to([index]), txl.int32(world), txl.int32(0))
+                            else:
+                                txl.ptx.atom.relaxed.gpu.global_.cas.b32(
+                                    seen, flag.ptr_to([index]), txl.int32(world), txl.int32(0))
                 txl.ptx.bar.sync(txl.uint32(3), txl.uint32(threads))
                 if system_ordered:
                     txl.ptx.fence.proxy.alias()
@@ -857,25 +865,20 @@ def gemm_all_reduce(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
                         ld_reduce(0, offset)
                         st(0, offset)
                 next_work(work)
-            if protocol == "cutlass":
-                # Performance only (the leader's release.sys is cumulative over the
-                # bar.sync): each thread drains its stores at GPU scope first, so the
-                # GPU-wide MEMBAR.SYS behind the exit release finishes in one batch.
-                # Under FlashInfer's protocol the fence costs more than it saves.
-                txl.ptx.fence.acq_rel.gpu()
             txl.ptx.bar.sync(txl.uint32(3), txl.uint32(threads))
-            with txl.If((warp == 6) & (lane == 0)), txl.Then():
-                sm = block_x + block_y * cm + first_work * (cm * cn)
-                if system_ordered:
-                    txl.ptx.fence.proxy.alias()
-                txl.ptx.multimem_red.release.sys.global_.add.s32(
-                    flag_mc.ptr_to([final_flags + sm]), txl.int32(1))
-                if not system_ordered and protocol != "cutlass":
-                    txl.ptx.fence.proxy.alias()
-                txl.assign(seen, 0)
-                with txl.While(seen != world):
-                    txl.ptx.atom.acquire.sys.global_.cas.b32(
-                        seen, flag.ptr_to([final_flags + sm]), txl.int32(world), txl.int32(0))
+            with txl.If(warp == 6), txl.Then():
+                with txl.If((lane == 0) if system_ordered else _elected()), txl.Then():
+                    sm = block_x + block_y * cm + first_work * (cm * cn)
+                    if system_ordered:
+                        txl.ptx.fence.proxy.alias()
+                    txl.ptx.multimem_red.release.sys.global_.add.s32(
+                        flag_mc.ptr_to([final_flags + sm]), txl.int32(1))
+                    if not system_ordered and protocol != "cutlass":
+                        txl.ptx.fence.proxy.alias()
+                    txl.assign(seen, 0)
+                    with txl.While(seen != world):
+                        txl.ptx.atom.acquire.sys.global_.cas.b32(
+                            seen, flag.ptr_to([final_flags + sm]), txl.int32(world), txl.int32(0))
 
     matrix_bytes = {"a": m * k * abb, "b": n * k * abb, "c": m * n * cb}
     kernel.__annotations__ = {

@@ -69,7 +69,7 @@ def _environment(shape: Shape):
     return patch.dict(os.environ, {"TIRX_DEEPGEMM_NUM_SMS_OVERRIDE": str(shape.num_sms)})
 
 
-def kernel(shape: Shape = Shape()):
+def kernel(shape: Shape = Shape(), *, ordering="sys_fenced"):
     config = shape.config()
     with _environment(shape):
         return module.get_kernel(
@@ -84,6 +84,7 @@ def kernel(shape: Shape = Shape()):
             activation_clamp=config.activation_clamp,
             fast_math=config.fast_math,
             collect_stats=True,
+            ordering=ordering,
         )
 
 

@@ -73,9 +73,12 @@ def test_full_gemm_multiple_ctas_publish_every_writer(
     assert report.verdict == "clean", report.format()
 
 
-def test_full_gemm_multiple_ctas_require_the_alias_bridge(kernel_cache):
+@pytest.mark.parametrize("protocol", ("cutlass", "flashinfer"))
+@pytest.mark.parametrize("use_tma_store", (True, False))
+def test_full_gemm_multiple_ctas_require_the_alias_bridge(protocol, use_tma_store, kernel_cache):
     shape = full.Shape(
-        config={**full.Shape().config, "max_active_clusters": 2, "use_tma_store": False},
+        protocol=protocol,
+        config={**full.Shape().config, "max_active_clusters": 2, "use_tma_store": use_tma_store},
     )
     function = full.kernel(shape)
     wanted = ("proxy", "alias")
