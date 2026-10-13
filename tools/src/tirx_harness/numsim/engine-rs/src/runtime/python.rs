@@ -1203,6 +1203,14 @@ pub fn extract_tensor_map_descriptor_registry(
                 allocation_ids.len()
             ))
         })?;
+        if memory
+            .full_view(allocation)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?
+            .multicast_replicas()
+            .is_some()
+        {
+            continue;
+        }
         let data_offset = storage.get_item("data_offset")?.extract::<usize>()?;
         let storage_byte_len = shape[0]
             .checked_mul(itemsize)
@@ -1961,6 +1969,45 @@ mod tests {
             assert!(mismatch
                 .to_string()
                 .contains("engine_hash disagrees with build_identity.engine_hash"));
+        });
+    }
+
+    #[test]
+    fn tensor_map_registry_discovery_does_not_read_multicast_windows() {
+        Python::attach(|py| {
+            let memory = GlobalMemory::new();
+            let window = memory.allocate_zeroed(TENSOR_MAP_DESCRIPTOR_BYTES).unwrap();
+            let replica = memory.allocate_zeroed(TENSOR_MAP_DESCRIPTOR_BYTES).unwrap();
+            let window_view = memory.full_view(window).unwrap();
+            window_view
+                .bind_multicast_replicas(vec![memory.full_view(replica).unwrap()])
+                .unwrap();
+
+            let storage = PyDict::new(py);
+            storage.set_item("allocation", 0).unwrap();
+            storage.set_item("data_offset", 0).unwrap();
+            storage.set_item("itemsize", 1).unwrap();
+            storage
+                .set_item("shape", vec![TENSOR_MAP_DESCRIPTOR_BYTES])
+                .unwrap();
+            storage.set_item("byte_strides", vec![1]).unwrap();
+            let buffers = PyDict::new(py);
+            buffers.set_item("window", storage).unwrap();
+            let inputs = PyDict::new(py);
+            inputs.set_item("buffers", buffers).unwrap();
+
+            extract_tensor_map_descriptor_registry(
+                &inputs,
+                &memory,
+                &[window, replica],
+                &["window"],
+                &[],
+            )
+            .unwrap();
+            assert!(matches!(
+                memory.read_bytes(&window_view, 0, 1),
+                Err(crate::MemoryError::MulticastAddressAccess { .. })
+            ));
         });
     }
 

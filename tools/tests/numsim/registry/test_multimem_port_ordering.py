@@ -7,6 +7,7 @@ import ast
 import pytest
 
 from ported.cutlass.sm100_gemm_all_reduce import gemm_all_reduce
+from tirx_harness.numsim.transpiler.host_prelude import normalize_host_tensor_map_prelude
 
 
 def _kernel(protocol, use_tma_store, use_2cta, rank, **options):
@@ -70,3 +71,11 @@ def test_origin_ordering_requires_explicit_opt_in(protocol):
 def test_unknown_ordering_is_rejected():
     with pytest.raises(ValueError, match="unsupported all-reduce ordering"):
         _kernel("cutlass", True, False, None, ordering="unknown")
+
+
+@pytest.mark.parametrize("protocol", ("cutlass", "flashinfer"))
+@pytest.mark.parametrize("use_tma_store", (True, False))
+def test_full_kernel_host_descriptors_normalize_for_both_epilogues(protocol, use_tma_store):
+    normalized = normalize_host_tensor_map_prelude(_kernel(protocol, use_tma_store, False, None))
+
+    assert normalized is not None

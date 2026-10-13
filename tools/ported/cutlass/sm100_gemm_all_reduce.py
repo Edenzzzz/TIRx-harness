@@ -340,7 +340,7 @@ def gemm_all_reduce(m, n, k, ab, c, rank, world, *, use_2cta, mma_tiler, cluster
     def host_prelude(params):
         a_map = txl.stack_alloca("tensormap", 1)
         b_map = txl.stack_alloca("tensormap", 1)
-        c_map = txl.stack_alloca("tensormap", 1)
+        c_map = txl.stack_alloca("tensormap", 1) if use_tma_store else None
 
         def encode(descriptor, dtype, data, inner, outer, box_inner, box_outer, swizzle_mode,
                    element_bytes):
