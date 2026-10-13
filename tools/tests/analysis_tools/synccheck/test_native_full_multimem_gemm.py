@@ -33,3 +33,18 @@ def test_full_gemm_pipeline_and_system_flag_waits_complete(
 
     assert report.native_payload["incomplete"] == []
     assert report.verdict == "clean", report.format()
+
+
+@pytest.mark.parametrize("protocol", ("cutlass", "flashinfer"))
+@pytest.mark.parametrize("use_tma_store", (True, False))
+@pytest.mark.parametrize("use_2cta", (True, False))
+def test_full_gemm_multiple_ctas_finish_the_rank_barrier(
+    protocol, use_tma_store, use_2cta, kernel_cache,
+):
+    shape = full.multi_cta_shape(protocol, use_tma_store, use_2cta)
+    bindings, _ = full.rank_inputs(shape)
+
+    report = synccheck(full.kernel(shape), inputs=bindings, cache_dir=kernel_cache)
+
+    assert report.native_payload["incomplete"] == []
+    assert report.verdict == "clean", report.format()

@@ -41,3 +41,22 @@ def test_full_gemm_all_reduce_matches_reference(
         values = result.outputs[numsim.rank_binding_name(result_name, rank)]
         np.testing.assert_array_equal(full.output_values(shape, values), expected)
         np.testing.assert_array_equal(result.outputs[numsim.rank_binding_name("flag", rank)], 0)
+
+
+@pytest.mark.parametrize("protocol", ("cutlass", "flashinfer"))
+@pytest.mark.parametrize("use_tma_store", (True, False))
+@pytest.mark.parametrize("use_2cta", (True, False))
+def test_full_gemm_multiple_ctas_publish_and_reset(
+    protocol, use_tma_store, use_2cta, kernel_cache,
+):
+    shape = full.multi_cta_shape(protocol, use_tma_store, use_2cta)
+    bindings, expected = full.rank_inputs(shape)
+    result_name = "c" if protocol == "flashinfer" else "out"
+    compiled = numsim.transpile(full.kernel(shape), cache_dir=kernel_cache)
+
+    result = numsim.Engine().run(compiled, bindings, outputs=[result_name, "flag"])
+
+    for rank in range(shape.world):
+        values = result.outputs[numsim.rank_binding_name(result_name, rank)]
+        np.testing.assert_array_equal(full.output_values(shape, values), expected)
+        np.testing.assert_array_equal(result.outputs[numsim.rank_binding_name("flag", rank)], 0)

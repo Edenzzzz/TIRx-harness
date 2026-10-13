@@ -45,6 +45,14 @@ The run exposed two preflight issues that are fixed in `6a61962`: direct-store
 builders no longer request an unused host TensorMap, and descriptor discovery
 skips multicast-window allocations.
 
+Expanded full-GEMM coverage also passes in that supported environment:
+**90 tests in 68.96 seconds**, using four pytest workers. This comprises
+23 IR/host-descriptor checks and 67 numerical, Racecheck, and Synccheck cases.
+The added cases execute multiple persistent clusters, one/two-CTA MMA, both
+epilogues, uneven work counts, and an alias-fence removal negative control.
+These tests run the committed kernel builder, not a GPU-only optimization
+prototype, and do not establish performance parity.
+
 The subsequent engine checks reproduced and corrected acceptance of invalid
 multimem specializations and stale provenance after unnamed writes. The nine
 multimem Rust tests pass. The complete Rust suite on macOS reports 770 passing

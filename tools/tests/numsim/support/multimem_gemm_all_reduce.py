@@ -62,6 +62,22 @@ def kernel(shape: Shape, *, ordering: str = "sys_fenced"):
     ).func
 
 
+def multi_cta_shape(protocol: str, use_tma_store: bool, use_2cta: bool) -> Shape:
+    return Shape(
+        world=4,
+        rows=1280 if use_2cta else 640,
+        reduction_size=64,
+        protocol=protocol,
+        config={
+            "use_2cta": use_2cta,
+            "mma_tiler": (256, 64) if use_2cta else (128, 64),
+            "cluster": (2, 1) if use_2cta else (1, 1),
+            "use_tma_store": use_tma_store,
+            "max_active_clusters": 2,
+        },
+    )
+
+
 def _operand_bytes(values: np.ndarray) -> np.ndarray:
     words = values.astype(np.float32).view(np.uint32)
     return (words >> 16).astype(np.uint16).view(np.uint8).reshape(-1)
