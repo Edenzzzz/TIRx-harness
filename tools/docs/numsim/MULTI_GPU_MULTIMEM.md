@@ -50,6 +50,7 @@ the obligations checked for the supported operations:
 | Strong `multimem.st`/`red` and their unicast counterparts | Scope must include the other thread. Cross-rank communication requires `.sys`; `.gpu`, `.cluster`, and `.cta` cannot cover another GPU. Concurrent weak stores race. Strong operations do not automatically publish unrelated data. |
 | Release arrival followed by an acquire read/poll | The acquire must observe the release's write, directly or through a qualifying read-modify-write (RMW) chain. Each relevant link must have the required strength and scope. A flag preinitialized to the target value provides no such observation. |
 | `fence.acq_rel.sys` + relaxed arrival; relaxed strong poll + `fence.acq_rel.sys` | The release pattern publishes only accesses before its release fence; the acquire pattern orders only accesses after its acquire fence. A weak poll, a bare relaxed poll, and a reduction's internal read cannot substitute for the required acquire pattern. |
+| Returned `atom.relaxed` / `atom.release` followed by an acquire fence | The returned RMW read preserves the release publications it observed for a subsequent, sufficiently scoped acquire fence. A fence before the read does not acquire that observation. A `red` operation's internal read cannot feed this pattern. |
 | `fence.proxy.alias` | A generic access and a multicast-alias access to the same data need an alias fence on their causal path, in either direction. A fence before the producer's write or after the consumer's read is ineffective. Warp/CTA ordering alone does not bridge the alias. |
 | Multicast flag arrival and unicast strong polling | The checked NVLS idiom permits a `.sys` release reduction and strong acquire poll on the same flag without an alias fence on that flag. The payload data still needs its own applicable alias bridge. |
 | `bar.warp.sync` / CTA synchronization around a signal and wait | The signaling lane must first acquire the participating lanes' writes, and the consuming lanes must acquire the waiting lane's dependency. A lane-0 signal does not implicitly publish every lane or warp. |
@@ -134,6 +135,12 @@ The decoder regressions in
 [`runtime/instructions/multimem.rs`](../../src/tirx_harness/numsim/engine-rs/src/runtime/instructions/multimem.rs)
 pair rejected integer/f64 vectors, signed-64 addition, and half-precision
 reduction min/max with accepted scalar min/max and floating-vector boundaries.
+
+The engine regression
+[`returned_release_rmw_can_feed_an_acquire_fence`](../../src/tirx_harness/numsim/engine-rs/src/native_analysis/racecheck/global_race.rs)
+checks both relaxed and release RMW reads, including negative controls for a
+fence before the read and for a reduction with no returned read. The release
+RMW case reproduced a false positive before the observation-preservation fix.
 
 The full-scale GEMM port also has direct tests. The IR and benchmark-evidence
 checks pass locally; the numerical and native checker rows still need execution

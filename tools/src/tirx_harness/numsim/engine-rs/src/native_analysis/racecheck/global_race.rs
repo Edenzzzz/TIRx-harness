@@ -9160,7 +9160,7 @@ impl GlobalRaceState {
                     proxy: semantics.proxy(),
                 });
             }
-        } else if semantics.order() == MemoryOrder::Relaxed {
+        } else if matches!(semantics.order(), MemoryOrder::Relaxed | MemoryOrder::Release) {
             merge_pending_acquire(
                 &mut actor_state.pending_acquire,
                 version.payload.heads.values().cloned(),
@@ -12349,6 +12349,80 @@ mod tests {
         );
 
         assert!(state.findings().next().is_none());
+    }
+
+    #[test]
+    fn returned_release_rmw_can_feed_an_acquire_fence() {
+        for order in [MemoryOrder::Relaxed, MemoryOrder::Release] {
+            for access_class in [MemoryAccessClass::Atomic, MemoryAccessClass::Reduction] {
+                for fence_after_rmw in [false, true] {
+                    let mut state =
+                        GlobalRaceState::new(Some(LaunchTopology::new(2, 1, 1).unwrap()));
+                    commit(
+                        &mut state,
+                        &batch(
+                            0,
+                            0,
+                            1,
+                            PhysicalAccessKind::Write,
+                            0,
+                            MemoryAccessSemantics::plain(),
+                        ),
+                    );
+                    commit(
+                        &mut state,
+                        &batch(
+                            0,
+                            0,
+                            2,
+                            PhysicalAccessKind::Write,
+                            4,
+                            atomic(MemoryOrder::Release, MemoryScope::Gpu),
+                        ),
+                    );
+                    if !fence_after_rmw {
+                        gpu_fence(&mut state, 1, 1, MemoryOrder::Acquire);
+                    }
+                    commit(
+                        &mut state,
+                        &batch(
+                            1,
+                            0,
+                            2,
+                            PhysicalAccessKind::AtomicReadModifyWrite,
+                            4,
+                            MemoryAccessSemantics::scoped(
+                                order,
+                                MemoryScope::Gpu,
+                                MemoryProxy::Generic,
+                                access_class,
+                            ),
+                        ),
+                    );
+                    if fence_after_rmw {
+                        gpu_fence(&mut state, 1, 3, MemoryOrder::Acquire);
+                    }
+                    commit(
+                        &mut state,
+                        &batch(
+                            1,
+                            0,
+                            4,
+                            PhysicalAccessKind::Read,
+                            0,
+                            MemoryAccessSemantics::plain(),
+                        ),
+                    );
+                    let ordered = access_class == MemoryAccessClass::Atomic && fence_after_rmw;
+                    assert_eq!(
+                        state.findings().any(|finding| finding.overlap().byte_offset() == 0),
+                        !ordered,
+                        "{order:?}/{access_class:?}, fence_after_rmw={fence_after_rmw}",
+                    );
+                    assert!(state.incomplete_reasons().next().is_none());
+                }
+            }
+        }
     }
 
     #[test]
