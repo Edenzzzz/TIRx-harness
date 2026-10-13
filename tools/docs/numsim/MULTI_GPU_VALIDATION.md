@@ -36,8 +36,13 @@ under Python 3.13.2, TVM 0.27.0.post1, and TIRx-kernels 0.1.2.post1:
 19 IR contract tests cover system-scope arrivals/polls, alias fences,
 one/two-CTA builds, fixed/runtime rank, and explicit origin-ordering opt-in;
 10 benchmark-evidence tests reject stale/missing/incorrect or slow results.
-These do not execute the kernel's memory effects. The new full-scale GEMM
-NumSim/Racecheck/Synccheck tests and GPU comparisons remain unrun.
+These do not execute the kernel's memory effects. On the supported Linux
+worker, the full-scale GEMM NumSim/Racecheck/Synccheck matrix now passes:
+**42 passed in 126.58 seconds**, covering both protocols, both epilogues,
+two/four ranks, three output dtypes, and origin-ordering counterexamples.
+The run exposed two preflight issues that are fixed in `6a61962`: direct-store
+builders no longer request an unused host TensorMap, and descriptor discovery
+skips multicast-window allocations.
 
 The subsequent engine checks reproduced and corrected acceptance of invalid
 multimem specializations and stale provenance after unnamed writes. The nine
@@ -55,6 +60,15 @@ The ABI/support-matrix tests and the 29 IR/evidence tests pass together:
 run exposed the stale ABI header, now corrected; its other 16 failures require
 generated native modules that could not link CPython symbols on macOS. Those
 execution-dependent checks still need the supported Linux environment.
+
+The corrected `sys_fenced` GPU kernel is numerically bitwise-correct on the
+worker, but its first timing probes do **not** meet the 99% bar: `cutlass_default`
+measured ratios of about 2.12 against CUTLASS and 1.68 against FlashInfer, and
+`llama8b_o_m2048` about 2.63 and 1.40. The explicit historical `origin`
+ordering remains near parity on the same probe. This is a real performance
+failure of the corrected default, not a pass; the full shape matrix is not
+claimed until the system-ordered implementation is optimized or its benchmark
+contract is revised with evidence.
 
 The pushed benchmark preflight was then run in the supported Linux environment
 with Python 3.13.16, TVM 0.27.0.post1, TIRx-kernels 0.1.2.post1, and Rust 1.99:
@@ -96,14 +110,16 @@ are historical reports; they have not been reproduced on this branch.
 
 ## Correctness limits to resolve
 
-- **Full-scale GEMM + all-reduce needs validation of the corrected default.**
+- **Full-scale GEMM + all-reduce needs performance closure for the corrected default.**
   The port now defaults to `ordering="sys_fenced"` for both origin schedules:
   complete stores, system-scope release/acquire, and alias fences on the
   publication path. Its new direct NumSim/Racecheck/Synccheck tests have not
   run yet and are not included in the 499-pass result. `ordering="origin"`
-  remains an explicit negative control. Run those tests, then measure the
-  corrected kernel across the complete shape matrix. Comparison rows now
-  record the ordering mode, and the gate cannot reuse old signaling results.
+  remains an explicit negative control. The CPU correctness/checker matrix now
+  passes, but the GPU timing probes fail the 99% gate. Optimize the corrected
+  kernel or establish an evidence-backed comparison contract, then measure the
+  complete shape matrix. Comparison rows record the ordering mode, and the gate
+  cannot reuse old signaling results.
 - **Mega MoE's provenance correction needs an end-to-end rerun.** The prior
   result was `review` for one `alias_stale_read` advisory. Focused Rust
   regressions now verify invalidation of overwritten named provenance,
