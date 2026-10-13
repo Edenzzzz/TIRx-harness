@@ -20,16 +20,17 @@ guides. Later commits through `0d2f86e` only change documentation.
 That run used Rust 1.99 and Python 3.11, with the native extension staged
 manually after the wheel rejected Python 3.11. It demonstrates those CPU
 checks executing, but does not pass the installation gate: the package
-requires Python 3.12 or 3.13, and the native tests must also be repeated in a
-supported installed environment. The full Linux Rust and parent-package suites
-remain pending.
+requires Python 3.12 or 3.13. Subsequent full-GEMM and Rust checks below use a
+supported installed Python 3.13 environment. The broader Python rule and
+parent-package suites still need their supported-environment rerun.
 
-The live GPU suite has not passed. Its first attempt lacked `cuda.bindings`;
+The initial live GPU microtest suite did not pass. Its first attempt lacked `cuda.bindings`;
 after that dependency was installed, the retry reported failures before the
 SSH connection was lost. The final diagnostics were not captured, so no
-kernel or hardware cause is established. No new performance-equivalence
-measurements completed. Continue the GPU checks under the shared socket lease
-when an active worker is available; preserve the same kernel implementation.
+kernel or hardware cause is established for that attempt. Subsequent full-GEMM
+probes execute under the shared socket lease, but have not passed the complete
+performance-equivalence gate. The live microtest suite also remains a separate
+gate; a full-kernel probe does not replace it.
 
 The subsequent full-scale publication correction passes **29 local tests**
 under Python 3.13.2, TVM 0.27.0.post1, and TIRx-kernels 0.1.2.post1:
@@ -49,9 +50,13 @@ multimem specializations and stale provenance after unnamed writes. The nine
 multimem Rust tests pass. The complete Rust suite on macOS reports 770 passing
 and 113 failing tests; an untouched `6b24e8c` engine snapshot reports 763 passing
 and the exact same 113 failures. All seven added regression tests pass. The
-failure-set comparison introduces no new failures, but is not a successful
-Linux gate: macOS execution is blocked by the engine's unsupported worker
-floating-point environment. The installed native frontend still lowers all
+failure-set comparison introduces no new failures; macOS execution is blocked
+by the engine's unsupported worker floating-point environment. A later supported
+Linux run at `90d82ea`, with Rust 1.99 and Python 3.13.15, passes **887 Rust unit
+tests, 4 architecture/import checks, and 3 public-surface checks**. It includes
+a reproduced-and-fixed false positive for a returned release RMW followed by an
+acquire fence. The regression also rejects a fence before the read and a
+reduction's non-returned read. The installed native frontend still lowers all
 28 existing multimem instruction cases. The new bulk-copy provenance kernel
 also lowers; execution of it and the complete Mega MoE case remains pending.
 
@@ -61,14 +66,14 @@ run exposed the stale ABI header, now corrected; its other 16 failures require
 generated native modules that could not link CPython symbols on macOS. Those
 execution-dependent checks still need the supported Linux environment.
 
-The corrected `sys_fenced` GPU kernel is numerically bitwise-correct on the
-worker, but its first timing probes do **not** meet the 99% bar: `cutlass_default`
-measured ratios of about 2.12 against CUTLASS and 1.68 against FlashInfer, and
-`llama8b_o_m2048` about 2.63 and 1.40. The explicit historical `origin`
-ordering remains near parity on the same probe. This is a real performance
-failure of the corrected default, not a pass; the full shape matrix is not
-claimed until the system-ordered implementation is optimized or its benchmark
-contract is revised with evidence.
+The corrected `sys_fenced` GPU implementation is numerically bitwise-correct
+on the exercised probe shapes, but has **not** passed the 99% performance bar.
+Synchronization and pipeline optimizations remain in progress. The complete
+19-shape matrix and independent repeat are not yet validated for the final
+implementation. Preserve the original comparison kernels and the 99% threshold;
+neither historical `origin` ordering nor a faster unchecked prototype closes
+this gate. Every accepted timing must use only the GPUs actually assigned by
+the socket lease; an override of that assignment invalidates the run.
 
 The pushed benchmark preflight was then run in the supported Linux environment
 with Python 3.13.16, TVM 0.27.0.post1, TIRx-kernels 0.1.2.post1, and Rust 1.99:
@@ -113,12 +118,12 @@ are historical reports; they have not been reproduced on this branch.
 - **Full-scale GEMM + all-reduce needs performance closure for the corrected default.**
   The port now defaults to `ordering="sys_fenced"` for both origin schedules:
   complete stores, system-scope release/acquire, and alias fences on the
-  publication path. Its new direct NumSim/Racecheck/Synccheck tests have not
-  run yet and are not included in the 499-pass result. `ordering="origin"`
+  publication path. Its direct NumSim/Racecheck/Synccheck tests pass in the
+  supported Linux environment and are separate from the older 499-pass result. `ordering="origin"`
   remains an explicit negative control. The CPU correctness/checker matrix now
   passes, but the GPU timing probes fail the 99% gate. Optimize the corrected
-  kernel or establish an evidence-backed comparison contract, then measure the
-  complete shape matrix. Comparison rows record the ordering mode, and the gate
+  kernel, then measure the complete shape matrix against the original baselines.
+  Comparison rows record the ordering mode, and the gate
   cannot reuse old signaling results.
 - **Mega MoE's provenance correction needs an end-to-end rerun.** The prior
   result was `review` for one `alias_stale_read` advisory. Focused Rust
@@ -134,11 +139,11 @@ are historical reports; they have not been reproduced on this branch.
   paths must stay consistent. The numerical model has GB200-specific floating
   reduction behavior, with one-ulp tolerance for half sums. A green test set
   is not a claim to cover arbitrary PTX forms, inputs, or GPU architectures.
-- **Full-kernel test execution is still pending.** The multimem ports now live
+- **Full-kernel coverage remains bounded.** The multimem ports now live
   in `ported/cutlass/`; tests own only bindings, references, and focused rule
   kernels. Two-shot retains its existing checker coverage. The new full-scale
-  GEMM tests complement the small model, but adding them does not establish
-  their result or replace the final GPU validation.
+  GEMM tests complement the small model and their CPU matrix passes, but that
+  result does not replace the final GPU validation or the other corpus gates.
 
 ## Resume gates
 

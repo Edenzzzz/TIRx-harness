@@ -142,9 +142,9 @@ checks both relaxed and release RMW reads, including negative controls for a
 fence before the read and for a reduction with no returned read. The release
 RMW case reproduced a false positive before the observation-preservation fix.
 
-The full-scale GEMM port also has direct tests. The IR and benchmark-evidence
-checks pass locally; the numerical and native checker rows still need execution
-in the restored validation environment:
+The full-scale GEMM port also has direct tests. Its numerical, Racecheck, and
+Synccheck matrix passes in the supported Linux environment; the IR and
+benchmark-evidence checks also pass. GPU performance closure remains separate:
 
 | File | Obligation |
 |---|---|
