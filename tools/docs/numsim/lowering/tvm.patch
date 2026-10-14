@@ -97,8 +97,68 @@ index c7703f9e0..1a73b4ff5 100644
 
    // Whether the function being generated is a __global__ kernel entry
    // (kDeviceKernelLaunch); __device__ subroutines return real values.
+diff --git a/src/tirx/transform/stmt_simplify.cc b/src/tirx/transform/stmt_simplify.cc
+index fd88f1150..8eab0f1a5 100644
+--- a/src/tirx/transform/stmt_simplify.cc
++++ b/src/tirx/transform/stmt_simplify.cc
+@@ -205,6 +205,42 @@ UnchangedOr<Stmt> StmtSimplifier::Mutate_(const BufferStoreNode* op, InplaceMode
+   return store;
+ }
+
++UnchangedOr<Stmt> StmtSimplifier::Mutate_(const EvaluateNode* op, InplaceMode inplace_mode) {
++  auto result = Parent::Mutate_(op, inplace_mode);
++  Stmt statement = std::move(result).ValueOrUnchanged(ffi::GetRef<Stmt>(op));
++  const auto* evaluate = statement.as<EvaluateNode>();
++  if (!evaluate) return statement;
++  const auto* call = evaluate->value.as<CallNode>();
++  if (!call || call->args.size() != 4) return statement;
++  const auto* operation = call->op.as<OpNode>();
++  if (!operation || operation->name != "tirx.ptx.mov") return statement;
++  const auto* modifier = call->args[2].as<StringImmNode>();
++  const auto* flags = call->args[3].as<StringImmNode>();
++  if (!modifier || !flags || !flags->value.empty() || modifier->value == "pred") return statement;
++  const auto* destination = call->args[0].as<TensorLoadNode>();
++  auto value = call->args[1].as<PrimExpr>();
++  if (!destination || !value || !destination->source.as<BufferVar>() ||
++      destination->ty != value->ty()) {
++    return statement;
++  }
++  BufferVar buffer = destination->source.as_or_throw<BufferVar>();
++  PrimType dtype = value->ty();
++  if (buffer.scope() != "local" || !dtype.IsScalar() ||
++      !(dtype.MatchesCode(DLDataTypeCode::kDLInt, DLDataTypeCode::kDLUInt) ||
++        dtype == PrimType::Float(32) || dtype == PrimType::Float(64))) {
++    return statement;
++  }
++  if (dtype.bits() != 16 && dtype.bits() != 32 && dtype.bits() != 64) return statement;
++  std::string width = std::to_string(dtype.bits());
++  bool valid_modifier =
++      modifier->value == "b" + width ||
++      (dtype.MatchesCode(DLDataTypeCode::kDLInt) && modifier->value == "s" + width) ||
++      (dtype.MatchesCode(DLDataTypeCode::kDLUInt) && modifier->value == "u" + width) ||
++      (dtype.MatchesCode(DLDataTypeCode::kDLFloat) && modifier->value == "f" + width);
++  if (!valid_modifier) return statement;
++  return BufferStore(buffer, value.value(), destination->indices, statement->span);
++}
++
+ bool StmtSimplifier::ArrayDeepEqual(const ffi::Array<PrimExpr>& lhs,
+                                     const ffi::Array<PrimExpr>& rhs) {
+   if (lhs.size() != rhs.size()) {
+diff --git a/src/tirx/transform/stmt_simplify.h b/src/tirx/transform/stmt_simplify.h
+index 37694283e..955302431 100644
+--- a/src/tirx/transform/stmt_simplify.h
++++ b/src/tirx/transform/stmt_simplify.h
+@@ -74,6 +74,8 @@ class StmtSimplifier : public IRMutatorWithAnalyzer {
+
+   UnchangedOr<Stmt> Mutate_(const IfThenElseNode* op, InplaceMode inplace_mode) override;
+
++  UnchangedOr<Stmt> Mutate_(const EvaluateNode* op, InplaceMode inplace_mode) override;
++
+   // eliminate useless stores
+   UnchangedOr<Stmt> Mutate_(const BufferStoreNode* op, InplaceMode inplace_mode) override;
+
 diff --git a/tests/python/tirx/codegen/test_codegen_cuda.py b/tests/python/tirx/codegen/test_codegen_cuda.py
-index 04e872c83..724eaddc3 100644
+index 04e872c83..4e7a50a43 100644
 --- a/tests/python/tirx/codegen/test_codegen_cuda.py
 +++ b/tests/python/tirx/codegen/test_codegen_cuda.py
 @@ -364,9 +364,7 @@ def test_tirx_cuda_kernel_return_zero_codegen_is_void_early_return():
@@ -112,7 +172,7 @@ index 04e872c83..724eaddc3 100644
      assert "return;" in src
      assert "return 0;" not in src
 
-@@ -416,6 +414,63 @@ def test_serial_disable_unroll_pragma_immediately_precedes_dynamic_for():
+@@ -416,6 +414,159 @@ def test_serial_disable_unroll_pragma_immediately_precedes_dynamic_for():
      assert re.search(r"#pragma unroll 1\s*for \(", src)
 
 
@@ -173,6 +233,114 @@ index 04e872c83..724eaddc3 100644
 +    assert "__builtin_assume(__tirx_cached_ctaid_x < 3);" in src
 +
 +
++@pytest.mark.parametrize("dtype", ["uint32", "int32", "float32", "uint64", "float64"])
++def test_scalar_ptx_register_copy_is_visible_to_value_simplification(dtype):
++    kernel = tvm.script.from_source(
++        f'''
++@T.prim_func
++def main(source: T.Buffer((32,), "{dtype}"), output: T.Buffer((32,), "{dtype}")):
++    T.device_entry()
++    lane = T.thread_id([32])
++    value = T.local_scalar("{dtype}")
++    T.ptx.mov.b{32 if dtype.endswith("32") else 64}(value, source[lane])
++    output[lane] = value
++''',
++        {"T": T},
++    )
++    simplified = tvm.tirx.transform.StmtSimplify()(tvm.IRModule({"main": kernel}))
++    assert "T.ptx.mov" not in simplified.script()
++
++
++@pytest.mark.parametrize("predicate", ["T.uint32(0)", "T.uint32(1)"])
++def test_predicated_ptx_register_copy_is_preserved(predicate):
++    kernel = tvm.script.from_source(
++        f'''
++@T.prim_func
++def main(source: T.Buffer((32,), "uint32"), output: T.Buffer((32,), "uint32")):
++    T.device_entry()
++    lane = T.thread_id([32])
++    value = T.local_scalar("uint32")
++    value = T.uint32(7)
++    T.ptx.mov.b32(value, source[lane], pred={predicate}, preserve_dst=True)
++    output[lane] = value
++''',
++        {"T": T},
++    )
++    simplified = tvm.tirx.transform.StmtSimplify()(tvm.IRModule({"main": kernel}))
++    assert "T.ptx.mov" in simplified.script()
++
++
++def test_bit_reinterpreting_register_copy_is_not_a_numeric_assignment():
++    @T.prim_func
++    def main(source: T.Buffer((32,), "uint32"), output: T.Buffer((32,), "float32")):
++        T.device_entry()
++        lane = T.thread_id([32])
++        value = T.local_scalar("float32")
++        T.ptx.mov.b32(value, source[lane])
++        output[lane] = value
++
++    simplified = tvm.tirx.transform.StmtSimplify()(tvm.IRModule({"main": main}))
++    assert "T.ptx.mov" in simplified.script()
++
++
++@pytest.mark.parametrize("modifier", ["b16", "f32", "unknown"])
++def test_invalid_register_copy_modifier_is_not_hidden_by_simplification(modifier):
++    temporary = tvm.tirx.decl_buffer((1,), "uint32", scope="local")
++    call = tvm.tirx.call_intrin(
++        "void", "tirx.ptx.mov", temporary[0], tvm.tirx.IntImm("uint32", 7), modifier, ""
++    )
++    function = tvm.tirx.PrimFunc([], tvm.tirx.Evaluate(call))
++    simplified = tvm.tirx.transform.StmtSimplify()(tvm.IRModule({"main": function}))
++    assert "T.ptx.mov" in simplified.script()
++
++
++@pytest.mark.gpu
++@pytest.mark.parametrize("width", [32, 64])
++def test_scalar_register_copy_preserves_special_value_bits(width):
++    floating_dtype = f"float{width}"
++    integer_dtype = f"uint{width}"
++    patterns = (
++        [0, 0x80000000, 1, 0x007FFFFF, 0x7F800000, 0xFF800000,
++         0x7FC00001, 0x7F800001, 0xFFC00123, 0x3F800000]
++        if width == 32 else
++        [0, 0x8000000000000000, 1, 0x000FFFFFFFFFFFFF,
++         0x7FF0000000000000, 0xFFF0000000000000, 0x7FF8000000000001,
++         0x7FF0000000000001, 0xFFF8000000000123, 0x3FF0000000000000]
++    )
++    bits = np.resize(np.asarray(patterns, dtype=integer_dtype), 32)
++    kernel = tvm.script.from_source(
++        f'''
++@T.prim_func
++def main(source: T.Buffer((32,), "{floating_dtype}"),
++         output: T.Buffer((32,), "{floating_dtype}")):
++    T.device_entry()
++    lane = T.thread_id([32])
++    value = T.local_scalar("{floating_dtype}")
++    T.ptx.mov.b{width}(value, source[lane])
++    output[lane] = value
++''',
++        {"T": T},
++    )
++    architecture = "sm_" + tvm.cuda(0).compute_version.replace(".", "")
++    _, compiled = _get_source(kernel, target={"kind": "cuda", "arch": architecture})
++    source = tvm.runtime.tensor(bits.view(floating_dtype), device=tvm.cuda(0))
++    output = tvm.runtime.tensor(np.zeros(32, dtype=floating_dtype), device=tvm.cuda(0))
++    compiled["main"](source, output)
++    np.testing.assert_array_equal(output.numpy().view(integer_dtype), bits)
++
++
  def test_cluster_cta_id_codegen_uses_coordinate_sregs():
      @T.prim_func
      def main(A: T.Buffer((1,), "int32")):
+diff --git a/tests/python/tirx/codegen/test_ptx_dialect.py b/tests/python/tirx/codegen/test_ptx_dialect.py
+index 9db466618..bc969ab23 100644
+--- a/tests/python/tirx/codegen/test_ptx_dialect.py
++++ b/tests/python/tirx/codegen/test_ptx_dialect.py
+@@ -1988,7 +1988,6 @@ def test_ptx_data_movement_dispatch():
+
+     src = _cuda_source(kernel)
+     for text in (
+-        "mov.b32 %0, %1;",
+         "mov.pred pd0, ps0;",
+         "prmt.b32 %0, %1, %2, %3;",
+         "prmt.b32.f4e %0, %1, %2, %3;",

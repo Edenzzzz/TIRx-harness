@@ -1,4 +1,4 @@
-# CUDA loop and execution-coordinate lowering
+# CUDA loop, coordinate, and scalar-copy lowering
 
 ## Finding
 
@@ -53,6 +53,15 @@ Bounds come from the corresponding static `thread_extent`, including partial
 CTAs. Dynamic extents receive no assumption. Cluster coordinates retain their
 existing coordinate-versus-linear-rank mapping.
 
+The further copy simplification lives in
+`src/tirx/transform/stmt_simplify.cc`,
+`StmtSimplifier::Mutate_(const EvaluateNode*)`. It converts an unpredicated
+`tirx.ptx.mov` between identical scalar register types into an ordinary local
+`BufferStore`, allowing normal value simplification and CUDA optimization.
+Predicated copies, predicate-register moves, mixed-type bit reinterpretations,
+and memory destinations retain their instruction forms. The PTX table and its
+one-instruction renderer are unchanged.
+
 ## Evidence
 
 The four-rank `dsv3_t1` case uses one token per rank, hidden size 7168,
@@ -66,6 +75,7 @@ reference launch configuration. Counts include predicated instructions.
 | Current TIRx lowering | 5944 | 224 | 128 | 1024 |
 | Generic serial-loop lowering prototype | 4264 | 112 | 128 | 1024 |
 | Loop and coordinate lowering | 4104 | 112 | 128 | 1024 |
+| Loop, coordinate, and scalar-copy lowering | 4096 | 112 | 128 | 1024 |
 
 The current port contains one combine body in generated CUDA; its two copies
 appear during CUDA compilation. Suppressing unrolling only on serial loops
@@ -97,6 +107,24 @@ outside the 99% gate, so full parity remains incomplete. Further lowering
 investigation and the other distributed kernels' matrices are in progress.
 Reduced static instruction count alone does not establish any unmeasured gate.
 
+Adding transparent scalar copies passes two prototype comparisons at 1.0059873x
+and 1.0042761x, both numerically exact. The corresponding rebuilt IR simplifier
+produces 4096 instructions as well; eight independent constant-register moves
+have a different assembly order, so those timings are not substituted for the
+rebuilt compiler's own matrix. That matrix is running from an immutable compiler
+snapshot and a separate prepared-kernel cache.
+
+The new matrix's first tiny `port_t2_h1024_e8_k1` comparison is 1.041x, despite
+bitwise-equal outputs and statistics. The other completed shapes pass. A
+within-session comparison of both compiler versions and DeepGEMM is queued to
+distinguish the regression; the scalar-copy patch is provisional.
+
+An audit of the other benchmark kernels covers 456 GEMM/all-reduce rank/config
+functions, 274 all-gather functions (including auxiliary kernels), and 72
+two-shot rank functions. None contains `tirx.ptx.mov`; the copy simplification
+does not match them. Their loop/coordinate compiler-regression matrices continue
+against the frozen preceding build.
+
 ## Regression tests
 
 The patch adds code-generation checks for a dynamic serial loop, a static
@@ -106,8 +134,12 @@ tests cover 17-, 32-, and 64-thread launches and cluster-coordinate mapping.
 
 On the unpatched installed compiler, the two default-policy regressions fail
 and the four explicit-policy/static-loop controls pass. On the rebuilt patched
-compiler, the complete non-GPU `test_codegen_cuda.py` suite reports 55 passed
-and one skipped. The focused command is:
+compiler, the complete non-GPU `test_codegen_cuda.py` suite reports 66 passed
+and one skipped. Both PTX dispatch/helper-golden regressions pass. Two GPU
+round trips preserve all bits of 32-/64-bit NaNs, signed zeros, infinities, and
+subnormals; five same-kernel partial-CTA GPU cases and all 59 simplifier tests
+also pass. Invalid width/type modifiers remain visible for normal rejection.
+The focused command is:
 
 ```bash
 python -m pytest -q -n 2 tests/python/tirx/codegen/test_codegen_cuda.py \
