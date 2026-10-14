@@ -824,15 +824,31 @@ def _run_distributed(
             "Unable to allocate a free TCP port for single-process distributed init."
         )
 
-    port = _find_free_port()
-    with _distributed_env(port):
-        ctx = mp.get_context("spawn")
-        result_queue = ctx.SimpleQueue()
-        mp.spawn(
-            _worker_entry,
-            args=(tuple(device_indices), tuple(device_uuids), cfg_dict, mode, result_queue),
-            nprocs=config.num_processes,
-            join=True,
-        )
-        rank_results = [result_queue.get() for _ in range(config.num_processes)]
-        return _aggregate_rank_results(rank_results)
+    ctx = mp.get_context("spawn")
+    last_error = None
+    for _ in range(32):
+        port = _find_free_port()
+        try:
+            with _distributed_env(port):
+                result_queue = ctx.SimpleQueue()
+                try:
+                    mp.spawn(
+                        _worker_entry,
+                        args=(
+                            tuple(device_indices), tuple(device_uuids), cfg_dict, mode, result_queue
+                        ),
+                        nprocs=config.num_processes,
+                        join=True,
+                    )
+                    rank_results = [result_queue.get() for _ in range(config.num_processes)]
+                    return _aggregate_rank_results(rank_results)
+                finally:
+                    result_queue.close()
+        except mp.ProcessRaisedException as error:
+            message = str(error)
+            if "EADDRINUSE" not in message and "address already in use" not in message:
+                raise
+            last_error = error
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Unable to allocate a free TCP port for distributed init.")

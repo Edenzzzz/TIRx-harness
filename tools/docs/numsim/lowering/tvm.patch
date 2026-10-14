@@ -207,7 +207,7 @@ index ce40f8157..fcdfb7cbc 100644
  /*! \brief function information needed by device */
  class FunctionInfoObj : public ffi::Object {
 diff --git a/src/runtime/pack_args.h b/src/runtime/pack_args.h
-index 0cbb631b1..800025c54 100644
+index 0cbb631b1..e5c76baeb 100644
 --- a/src/runtime/pack_args.h
 +++ b/src/runtime/pack_args.h
 @@ -34,6 +34,7 @@
@@ -218,7 +218,7 @@ index 0cbb631b1..800025c54 100644
  #include <cstring>
  #include <vector>
 
-@@ -319,6 +320,53 @@ inline ffi::Function PackFuncVoidAddr(F f, const ffi::Array<DLDataType>& arg_typ
+@@ -319,6 +320,59 @@ inline ffi::Function PackFuncVoidAddr(F f, const ffi::Array<DLDataType>& arg_typ
        codes[i] = detail::GetArgConvertCode(arg_types[i]);
      }
    }
@@ -245,29 +245,35 @@ index 0cbb631b1..800025c54 100644
 +    struct alignas(16) ScalarGroupStorage {
 +      std::array<unsigned char, 32> bytes;
 +    };
-+    auto grouped = [f, scalar_groups, count = arg_types.size()](
-+                       ffi::PackedArgs args, ffi::Any* result, void** addresses) {
-+      std::vector<ScalarGroupStorage> storage(scalar_groups.size());
-+      std::vector<void*> regrouped;
-+      regrouped.reserve(count);
-+      size_t group_index = 0;
-+      for (size_t index = 0; index < count;) {
-+        if (group_index < scalar_groups.size() && scalar_groups[group_index].first == index) {
-+          size_t bytes = scalar_groups[group_index].second;
-+          for (size_t field = 0; field < 4; ++field) {
-+            std::memcpy(storage[group_index].bytes.data() + field * bytes, addresses[index + field],
-+                        bytes);
++    auto pack_grouped = [&]<int size>() {
++      auto grouped = [f, scalar_groups, count = arg_types.size()](
++                         ffi::PackedArgs args, ffi::Any* result, void** addresses) {
++        detail::TempArray<ScalarGroupStorage, size / 4> storage_(scalar_groups.size());
++        detail::TempArray<void*, size> regrouped_(count);
++        ScalarGroupStorage* storage = storage_.data();
++        void** regrouped = regrouped_.data();
++        size_t group_index = 0;
++        size_t output_index = 0;
++        for (size_t index = 0; index < count;) {
++          if (group_index < scalar_groups.size() && scalar_groups[group_index].first == index) {
++            size_t bytes = scalar_groups[group_index].second;
++            for (size_t field = 0; field < 4; ++field) {
++              std::memcpy(storage[group_index].bytes.data() + field * bytes,
++                          addresses[index + field], bytes);
++            }
++            regrouped[output_index++] = storage[group_index].bytes.data();
++            ++group_index;
++            index += 4;
++          } else {
++            regrouped[output_index++] = addresses[index++];
 +          }
-+          regrouped.push_back(storage[group_index].bytes.data());
-+          ++group_index;
-+          index += 4;
-+        } else {
-+          regrouped.push_back(addresses[index++]);
 +        }
-+      }
-+      f(args, result, regrouped.data());
++        f(args, result, regrouped);
++      };
++      return detail::PackFuncVoidAddr_<size>(grouped, codes);
 +    };
-+    return detail::PackFuncVoidAddr_<0>(grouped, codes);
++    return arg_types.size() <= 32 ? pack_grouped.template operator()<32>()
++                                  : pack_grouped.template operator()<0>();
 +  }
    size_t num_void_args = arg_types.size();
    // specialization
@@ -529,7 +535,7 @@ index 37694283e..955302431 100644
    UnchangedOr<Stmt> Mutate_(const BufferStoreNode* op, InplaceMode inplace_mode) override;
 
 diff --git a/tests/python/tirx/codegen/test_codegen_cuda.py b/tests/python/tirx/codegen/test_codegen_cuda.py
-index 04e872c83..2aebf6b4d 100644
+index 04e872c83..541b805cd 100644
 --- a/tests/python/tirx/codegen/test_codegen_cuda.py
 +++ b/tests/python/tirx/codegen/test_codegen_cuda.py
 @@ -364,9 +364,7 @@ def test_tirx_cuda_kernel_return_zero_codegen_is_void_early_return():
@@ -722,7 +728,7 @@ index 04e872c83..2aebf6b4d 100644
  def test_cluster_cta_id_codegen_uses_coordinate_sregs():
      @T.prim_func
      def main(A: T.Buffer((1,), "int32")):
-@@ -432,6 +602,153 @@ def test_cluster_cta_id_codegen_uses_coordinate_sregs():
+@@ -432,6 +602,203 @@ def test_cluster_cta_id_codegen_uses_coordinate_sregs():
      assert "cooperative_groups::cluster_group::block_index" not in src
 
 
@@ -871,6 +877,56 @@ index 04e872c83..2aebf6b4d 100644
 +            slot = index if 0 <= index < 4 else 0
 +            expected = left[slot] + left[0] + int(right[slot] * 8)
 +            np.testing.assert_array_equal(output.numpy(), np.full(32, expected, dtype="int64"))
++
++
++def _large_parameter_table_list(groups):
++    parameters = ", ".join(
++        f"weight_{group}_{slot}: T.int64" for group in range(groups) for slot in range(4)
++    )
++    stores = "\n".join(
++        f"    output[{group}, lane] = T.Select(index == 3, weight_{group}_3, "
++        f"T.Select(index == 2, weight_{group}_2, "
++        f"T.Select(index == 1, weight_{group}_1, weight_{group}_0)))"
++        for group in range(groups)
++    )
++    return tvm.script.from_source(
++        f"""
++@T.prim_func
++def main(output: T.Buffer(({groups}, 32), "int64"), index: T.int32, {parameters}):
++    T.device_entry()
++    lane = T.thread_id([32])
++{stores}
++""",
++        {"T": T},
++    )
++
++
++@pytest.mark.parametrize("groups", [1, 7, 8, 9])
++def test_parameter_table_count_covers_stack_and_heap_argument_packing(groups):
++    source, _ = _get_source(_large_parameter_table_list(groups))
++    assert source.count("const __grid_constant__ __tirx_scalar_array_") == groups * 2
++
++
++@pytest.mark.gpu
++@pytest.mark.parametrize("groups", [1, 7, 8, 9])
++def test_parameter_table_stack_and_heap_paths_preserve_values(groups, tmp_path):
++    architecture = "sm_" + tvm.cuda(0).compute_version.replace(".", "")
++    _, compiled = _get_source(
++        _large_parameter_table_list(groups), target={"kind": "cuda", "arch": architecture}
++    )
++    library = str(tmp_path / "parameter_tables.so")
++    compiled.export_library(library)
++    restored = tvm.runtime.load_module(library)
++    weights = [(group + 1) * 2**40 - slot * 17 for group in range(groups) for slot in range(4)]
++    output = tvm.runtime.tensor(np.zeros((groups, 32), dtype="int64"), device=tvm.cuda(0))
++    for implementation in (compiled, restored):
++        for index in [-1, 0, 1, 2, 3, 4]:
++            implementation["main"](output, index, *weights)
++            slot = index if 0 <= index < 4 else 0
++            expected = np.repeat(
++                np.asarray(weights, dtype="int64").reshape(groups, 4)[:, slot, None], 32, axis=1
++            )
++            np.testing.assert_array_equal(output.numpy(), expected)
 +
 +
  @pytest.mark.gpu

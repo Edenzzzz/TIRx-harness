@@ -85,6 +85,15 @@ arguments, and NumSim multi-rank bindings do not change. Compiler and runtime
 must both come from the patched build; this introduces no newer instruction
 or toolkit requirement than the existing CUDA 13.2 comparison.
 
+The grouped launch path originally allocated four temporary vectors per call:
+converted addresses, narrow-value holders, grouped storage, and regrouped
+addresses. It now uses bounded stack storage for at most 32 original arguments
+and eight groups; larger calls retain dynamic storage. The argument values,
+metadata, public ABI, and CUDA instructions are unchanged. The two frozen
+compiler binaries are byte-identical, and comparisons load the same prepared
+statistics/no-statistics kernel libraries. Only the CUDA runtime's argument
+marshalling changes.
+
 ## Evidence
 
 The four-rank `dsv3_t1` case uses one token per rank, hidden size 7168,
@@ -175,6 +184,44 @@ unchanged 99% gate. That is a performance miss, not the separate rendezvous
 port collision; its row is retained and needs further lowering analysis.
 The other repeat and compiler-regression cases continue under the GPU lease.
 
+An old/stack/stack/old comparison uses one four-GPU lease, the unchanged
+11-round benchmark, and separate worker invocations:
+
+| Argument packing | TIRx microseconds | DeepGEMM microseconds | Ratio |
+|---|---:|---:|---:|
+| Dynamic, first | 99.028 | 98.527 | 1.005085 |
+| Stack, first | 96.322 | 96.183 | 1.001445 |
+| Stack, repeat | 99.213 | 98.379 | 1.008477 |
+| Dynamic, repeat | 97.983 | 97.075 | 1.009354 |
+
+All four comparisons are numerically exact. These observations do not erase
+the earlier 1.0134496x miss or prove that allocation cost alone explains it.
+The stack-packing build's complete 14-shape matrix and independent repeat
+are running in separate result files.
+
+### Timeline evidence
+
+Four-rank IKET captures retain the original work assignment. The cold capture
+uses the benchmark's existing 8 GB cache flush, 20-million-cycle sleep, and
+stream all-reduce before launch. Its CUDA-event wrapper is diagnostic only;
+the uninstrumented Kineto benchmark remains the performance gate. The warm
+capture separately verifies output/statistics against DeepGEMM. Trace files
+remain outside Git under the caller's artifact directory.
+
+1. **Critical path:** the slowest rank's MMA role ends at 83.936 microseconds;
+   phase-two NVLink synchronization ends at 89.536 and the final epilogue at
+   96.928. L1-full waits reach 23.328 microseconds. These are exposed dependency
+   waits, not evidence that fewer static instructions alone close the gate.
+2. **Overlap and bubbles:** loader, MMA, and epilogue roles begin within
+   1.344–1.632 microseconds, so the roles overlap rather than execute serially.
+   Their long completion/publication waits expose gaps; no hardware-utilization
+   or stall-counter conclusion is inferred from these timestamps.
+3. **Balance:** the four MMA-role endpoints range from 53.888 to 83.936
+   microseconds. Earlier-finishing ranks spend up to 41.344 microseconds in
+   phase-two NVLink synchronization. This capture shows a rank-dependent tail;
+   redistributing the work would violate the port-fidelity requirement and is
+   not used as a fix.
+
 ## Regression tests
 
 The patch adds code-generation checks for a dynamic serial loop, a static
@@ -184,18 +231,21 @@ tests cover 17-, 32-, and 64-thread launches and cluster-coordinate mapping.
 
 On the unpatched installed compiler, the two default-policy regressions fail
 and the four explicit-policy/static-loop controls pass. On the rebuilt patched
-compiler, the complete non-GPU `test_codegen_cuda.py` suite reports 75 passed
+compiler, the complete non-GPU `test_codegen_cuda.py` suite reports 79 passed
 and one skipped. Both PTX dispatch/helper-golden regressions pass. Two GPU
 round trips preserve all bits of 32-/64-bit NaNs, signed zeros, infinities, and
 subnormals; five same-kernel partial-CTA GPU cases and all 59 simplifier tests
 also pass. Invalid width/type modifiers remain visible for normal rejection.
 This includes direct-codegen controls for contiguous, noncontiguous, and
 reordered device parameters.
-Seven GPU tests pass: the two special-bit copy cases, four
-parameter-table scalar types, and mixed-type multiple parameter groups. The
+Eleven GPU tests pass: the two special-bit copy cases, four
+parameter-table scalar types, mixed-type multiple parameter groups, and four
+group-count cases covering both stack and dynamic packing. The
 table cases exercise both direct launches and exported/reloaded libraries,
 signed out-of-range indices, unrelated scalar arguments, and direct uses of a
 grouped parameter outside its selection table.
+Group counts 1, 7, 8, and 9 exercise the 32-argument boundary and dynamic
+fallback through both direct calls and exported/reloaded libraries.
 With this compiler selected, the harness's complete multimem/peer numerical,
 ordering-rule, and NumSim registry/ABI run passes 943 tests; all 94 live
 multimem GPU microtests also pass with no skips under a four-GPU socket lease.

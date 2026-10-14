@@ -109,6 +109,16 @@ and still fails the 99% gate. Keep that miss distinct from an unrelated
 `EADDRINUSE` startup failure: the latter's missing measurement is retried,
 whereas the performance miss remains recorded for further lowering work.
 
+The next generic runtime-lowering change removes four per-launch temporary
+heap allocations when grouped parameters fit in 32 argument slots. CUDA code
+and prepared kernel libraries remain unchanged. Its codegen suite passes
+**79 tests with one skip**, and **11 GPU tests pass**, including stack/dynamic
+boundary cases and library reloads. Two one-token comparisons pass at
+**1.001445 / 1.008477**; the complete stack-packing matrix and repeat remain
+open. A separate **13-test** launcher/fidelity run verifies bounded retries
+for rendezvous port collisions, queue/environment cleanup, and immediate
+propagation of non-startup errors. Bootstrap retries change no kernel or timer.
+
 ## Historical evidence
 
 After the ABI update, **138 additional targeted tests pass** for the complete
