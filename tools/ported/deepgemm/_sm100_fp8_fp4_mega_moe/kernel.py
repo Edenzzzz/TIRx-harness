@@ -703,11 +703,12 @@ def get_kernel(
             )
         return rank_offset
 
-    def load_symm_rank_base(dst, smem_symm_rank_bases, mapped_rank_idx):
-        if num_processes > 1:
-            return txl.ptx.ld.shared.u64(
-                dst, smem_symm_rank_bases.ptr_to([txl.cast(mapped_rank_idx, "int32")])
-            )
+    def load_symm_rank_base(dst, sym_buffer_base, symm_rank_offsets, mapped_rank_idx):
+        return txl.assign(
+            dst,
+            sym_buffer_base
+            + txl.cast(symm_rank_offset_arg_expr(symm_rank_offsets, mapped_rank_idx), "uint64"),
+        )
 
     # ---- shared-memory budget, barrier numbering, and epilogue chunking ----
     sm100_smem_capacity = 232448
@@ -1346,22 +1347,6 @@ def get_kernel(
         task_info_full_barriers = txl.MBarrier(smem, num_schedule_stages)
         task_info_empty_barriers = txl.MBarrier(smem, num_schedule_stages)
         tmem_ptr_in_smem = smem.alloc((1,), txl.u32, align=4)
-        if num_processes > 1:
-            smem_symm_rank_bases = smem.alloc((num_processes,), txl.u64, align=8)
-        else:
-            # The single-rank specialization never reads this view. Keep the
-            # original zero-byte ABI instead of reserving an unreachable slot.
-            smem_symm_rank_bases_data = txl.reinterpret(
-                PointerType(PrimType("uint64")), tmem_ptr_in_smem.ptr_to([0])
-            )
-            smem_symm_rank_bases = txl.decl_buffer(
-                (1,),
-                "uint64",
-                data=smem_symm_rank_bases_data,
-                scope="shared.dyn",
-                elem_offset=0,
-                align=8,
-            )
         if smem.bytes > sm100_smem_capacity:
             raise ValueError(
                 f"MegaMoE K SMEM layout uses {smem.bytes} bytes, capacity is {sm100_smem_capacity}"
@@ -1673,12 +1658,8 @@ def get_kernel(
                             txl.assign(barrier_target, txl.int32(1))
                             with txl.If(barrier_signal_sign != 0), txl.Then():
                                 txl.assign(barrier_target, txl.int32(-1))
-                            txl.assign(
-                                symm_rank_base,
-                                sym_buffer_base + txl.cast(symm_rank_offsets[0], "uint64"),
-                            )
                             load_symm_rank_base(
-                                symm_rank_base, smem_symm_rank_bases, sync_thread_idx
+                                symm_rank_base, sym_buffer_base, symm_rank_offsets, sync_thread_idx
                             )
                             peer_red_add_rel_sys_s32(
                                 symm_rank_base,
@@ -2352,15 +2333,6 @@ def get_kernel(
             tmem_empty_barrier_init_count = 2 * kernel_config.num_epilogue_threads
             with txl.If(flat_warp_idx == 0):
                 with txl.Then():
-                    with txl.If(num_processes > 1), txl.Then():
-                        with txl.If(lane_idx < num_processes), txl.Then():
-                            txl.ptx.st.shared.u64(
-                                smem_symm_rank_bases.ptr_to([lane_idx]),
-                                sym_buffer_base
-                                + txl.cast(
-                                    symm_rank_offset_arg_expr(symm_rank_offsets, lane_idx), "uint64"
-                                ),
-                            )
                     with txl.If(txl.cuda.elect_sync()), txl.Then():
                         st_shared_bulk(smem_expert_count.ptr_to([0]), txl.uint32(num_experts * 4))
                 with txl.Else():
@@ -2529,12 +2501,11 @@ def get_kernel(
                                 txl.uint32(1),
                             )
                             txl.assign(dispatch_dst_slot_idx, txl.cast(dispatch_slot_u32, "int32"))
-                            txl.assign(
-                                symm_rank_base,
-                                sym_buffer_base + txl.cast(symm_rank_offsets[0], "uint64"),
-                            )
                             load_symm_rank_base(
-                                symm_rank_base, smem_symm_rank_bases, dispatch_dst_rank_idx
+                                symm_rank_base,
+                                sym_buffer_base,
+                                symm_rank_offsets,
+                                dispatch_dst_rank_idx,
                             )
                             peer_store_u32(
                                 symm_rank_base,
@@ -2580,10 +2551,9 @@ def get_kernel(
                         scheduler_cached_status,
                         workspace_expert_send_count.ptr_to([dispatch_expert_idx]),
                     )
-                    txl.assign(
-                        symm_rank_base, sym_buffer_base + txl.cast(symm_rank_offsets[0], "uint64")
+                    load_symm_rank_base(
+                        symm_rank_base, sym_buffer_base, symm_rank_offsets, dispatch_dst_rank_idx
                     )
-                    load_symm_rank_base(symm_rank_base, smem_symm_rank_bases, dispatch_dst_rank_idx)
                     peer_store_u64(
                         symm_rank_base,
                         txl.uint64(
@@ -2595,10 +2565,9 @@ def get_kernel(
                     peer_recv_count_sum_prev = txl.local_scalar(
                         "uint64"
                     )  # atom returns the old value; unused here
-                    txl.assign(
-                        symm_rank_base, sym_buffer_base + txl.cast(symm_rank_offsets[0], "uint64")
+                    load_symm_rank_base(
+                        symm_rank_base, sym_buffer_base, symm_rank_offsets, dispatch_dst_rank_idx
                     )
-                    load_symm_rank_base(symm_rank_base, smem_symm_rank_bases, dispatch_dst_rank_idx)
                     peer_atomic_add_u64(
                         peer_recv_count_sum_prev,
                         symm_rank_base,
@@ -2809,11 +2778,11 @@ def get_kernel(
                     )
                 with txl.If(txl.cuda.elect_sync()), txl.Then():
                     with txl.unroll(0, num_pull_chunks) as pull_chunk_idx:
-                        txl.assign(
-                            symm_rank_base, sym_buffer_base + txl.cast(symm_rank_offsets[0], "uint64")
-                        )
                         load_symm_rank_base(
-                            symm_rank_base, smem_symm_rank_bases, current_rank_in_expert_idx
+                            symm_rank_base,
+                            sym_buffer_base,
+                            symm_rank_offsets,
+                            current_rank_in_expert_idx,
                         )
                         tma_load_1d_symm(
                             smem_send_buffers.ptr_to([role_warp_idx, 0]),
@@ -2856,11 +2825,11 @@ def get_kernel(
                 txl.assign(dispatch_dst_rank_idx, lane_idx)
                 with txl.While(dispatch_dst_rank_idx < hidden // 128):
                     pulled_sf = txl.local_scalar("uint32")
-                    txl.assign(
-                        symm_rank_base, sym_buffer_base + txl.cast(symm_rank_offsets[0], "uint64")
-                    )
                     load_symm_rank_base(
-                        symm_rank_base, smem_symm_rank_bases, current_rank_in_expert_idx
+                        symm_rank_base,
+                        sym_buffer_base,
+                        symm_rank_offsets,
+                        current_rank_in_expert_idx,
                     )
                     peer_load_u32(
                         pulled_sf,
@@ -2877,11 +2846,11 @@ def get_kernel(
                 txl.cuda.warp_sync()
                 with txl.If(txl.cuda.elect_sync()), txl.Then():
                     pulled_weight = txl.local_scalar("float32")
-                    txl.assign(
-                        symm_rank_base, sym_buffer_base + txl.cast(symm_rank_offsets[0], "uint64")
-                    )
                     load_symm_rank_base(
-                        symm_rank_base, smem_symm_rank_bases, current_rank_in_expert_idx
+                        symm_rank_base,
+                        sym_buffer_base,
+                        symm_rank_offsets,
+                        current_rank_in_expert_idx,
                     )
                     peer_load_f32(
                         pulled_weight,
@@ -4120,12 +4089,11 @@ def get_kernel(
                                         [epilogue_wg_idx, l2_cd_elem_offset]
                                     )
                                     lds128(smem_ptr, epilogue_bf16_packed)
-                                    txl.assign(
-                                        symm_rank_base,
-                                        sym_buffer_base + txl.cast(symm_rank_offsets[0], "uint64"),
-                                    )
                                     load_symm_rank_base(
-                                        symm_rank_base, smem_symm_rank_bases, dst_rank_idx
+                                        symm_rank_base,
+                                        sym_buffer_base,
+                                        symm_rank_offsets,
+                                        dst_rank_idx,
                                     )
                                     dst_ptr = (
                                         txl.cast(symm_buffer_layout.combine_token_offset, "uint64")

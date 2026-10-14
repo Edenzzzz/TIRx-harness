@@ -31,6 +31,7 @@ def _worker(rank: int, world: int, port: int, case_name: str, out_dir: str, path
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem
     import tvm
+    from tirx_kernels.runner import cuda_target
 
     from tests.numsim.microtests.cases.multimem import CASES_BY_NAME
 
@@ -41,7 +42,7 @@ def _worker(rank: int, world: int, port: int, case_name: str, out_dir: str, path
     try:
         case = CASES_BY_NAME[case_name]
         arguments = case.rank_arguments(rank, world)
-        target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
+        target = cuda_target()
         with target:
             executable = tvm.compile(
                 tvm.IRModule({"main": case.prim_func()}), target=target, tir_pipeline="tirx"
@@ -100,6 +101,7 @@ def _kernel_worker(rank: int, world: int, port: int, kernel: tuple, inputs: tupl
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem
     import tvm
+    from tirx_kernels.runner import cuda_target
 
     from tests.numsim.microtests.harness import PairedTensorMap, _torch_tensor_map
 
@@ -142,7 +144,7 @@ def _kernel_worker(rank: int, world: int, port: int, kernel: tuple, inputs: tupl
                              if array is value.array), None)
                 tensor_maps.append(_torch_tensor_map(value, base=base))
                 tensors[name] = tensor_maps[-1].descriptor
-        target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
+        target = cuda_target()
         with target:
             executable = tvm.compile(tvm.IRModule({"main": func}), target=target,
                                      tir_pipeline="tirx")

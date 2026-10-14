@@ -23,7 +23,7 @@ The current audit found:
 | Two-shot all-reduce | Preserves the baseline's data layout, constexpr loop/rank, and terminal release/relaxed-CAS protocol. All 18 shapes and the independent repeat now pass bitwise equality, independent-reference precision, flag reset, and the unchanged 99% performance gate. |
 | GEMM + all-reduce | Restored baseline waits, elected leaders, and barrier sequence; removed the added exit GPU fence. All 19 shapes, both origins, three matched configurations, and the independent repeat now meet the unchanged precision/performance gate. `sys_fenced` remains a separate semantic example. |
 | All-gather GEMM | `benchmarks.peer.fidelity` restores CUTLASS's per-shard launches, exact auxiliary kernels, and common host schedule. Both 17-shape GPU rounds pass bitwise/reference correctness and the 99% gate at baseline-selected configurations; worst ratios are 1.001948 / 1.002322. The earlier fused/chunked and NumSim copy-warp variants are separate examples, not fidelity evidence. |
-| Mega MoE | The default retains the reference timeout, load, work-partition, and synchronization schedule, including mask-guarded combine-load warp barriers. `sys_fenced` remains a separate semantic example. The prior unpatched compiler missed the one-token gate at 1.0444x. The rebuilt generic CUDA loop/coordinate lowering passes the complete first 14-shape GPU matrix with bitwise output/statistics equality; its worst ratio is 1.0092574x (`dsv3_t1`). The independent repeat's one-token result is 1.0106940x, just outside the 99% gate, so full parity remains incomplete. Further lowering investigation and the other kernels' compiler-regression matrices are running. The [compiler patch, source, tests, and evidence](lowering/README.md) are explicit prerequisites; these measurements do not validate an unpatched compiler. |
+| Mega MoE | The default retains the reference timeout, load, work-partition, and synchronization schedule, including mask-guarded combine-load warp barriers. `sys_fenced` remains separate. Generic CUDA loop/coordinate/copy/parameter-table lowering now restores direct parameter-based peer-offset reads instead of a port-only shared cache. Its first one-token comparison is 1.001989x with bitwise-equal output/statistics. The final 14-shape matrix and repeat remain open; earlier coordinate-only repeat evidence missed the gate at 1.010694x. The [compiler patch, source, tests, and evidence](lowering/README.md) are explicit prerequisites, not evidence for an unpatched compiler. |
 
 Actual CUTLASS and FlashInfer PTX/CUBIN and TIRx CUBIN were captured with the
 existing compiler under the socket lease. The CUTLASS artifact confirms elected
@@ -62,6 +62,38 @@ The faithful all-gather GPU matrix now has **17 shapes × 8 matched CUTLASS
 configurations × 2 rounds** with all rows numerically correct; the
 baseline-selected worst ratios are **1.001948 / 1.002322**.
 
+On October 14, the release-mode race-check memory growth was traced to a
+byte-occupancy mutation inside `debug_assert!`, which release builds omit.
+The mutation now executes independently of the assertion. Both new clearing
+regressions fail before the fix; all 13 interval-map tests pass in debug and
+optimized release builds afterward. The complete engine suite passes **890
+unit tests, four checker-import tests, and three public-surface tests** in
+both build modes. The strong-flag-access regressions retain the independent
+unordered-payload counterexample; 105 focused checker regressions and 82
+additional related cases pass.
+
+The complete four-rank Mega MoE numerical, Racecheck, and Synccheck examples
+now pass, including the previously unbounded shared-pool alias test. After
+restoring parameter-based peer-offset selection without a shared cache, the
+same **four tests pass in 89.83 seconds**, and **26 IR/fidelity gate tests
+pass**. Public scalar arguments and per-rank NumSim bindings are unchanged.
+The corresponding generic CUDA parameter-table lowering passes its initial
+four-type GPU argument checks; its independent full performance matrix is
+running and remains a separate gate.
+
+A fresh supported-Linux run of the complete multimem/peer numerical and
+ordering-rule matrix passes **617 tests in 168.50 seconds** with four pytest
+workers. Repeating it with the patched compiler and adding the entire NumSim
+registry/ABI suites passes **943 tests in 210.27 seconds**. This includes every
+full-GEMM protocol/epilogue case, strong-flag positive and unobserved-payload
+negative controls, all peer/multicast rule files, and complete Mega MoE checks.
+All **94 live multimem GPU microtests pass in 886.48 seconds**, with one pytest
+worker and four socket-leased GPUs. No cases are skipped. The workers use the
+existing generic CUDA-target helper instead of a fixed device architecture;
+kernel instruction forms and NumSim semantics are unchanged.
+
+## Historical evidence
+
 After the ABI update, **138 additional targeted tests pass** for the complete
 GEMM numerical/race/sync matrix, IR contracts, support-table generation, and
 benchmark evidence gates. The faithful all-gather GPU probe matches CUTLASS
@@ -95,10 +127,9 @@ parent-package suites still need their supported-environment rerun.
 The initial live GPU microtest suite did not pass. Its first attempt lacked `cuda.bindings`;
 after that dependency was installed, the retry reported failures before the
 SSH connection was lost. The final diagnostics were not captured, so no
-kernel or hardware cause is established for that attempt. Subsequent full-GEMM
-probes execute under the shared socket lease, but have not passed the complete
-performance-equivalence gate. The live microtest suite also remains a separate
-gate; a full-kernel probe does not replace it.
+kernel or hardware cause is established for that attempt. The subsequent
+94-case live microtest run above passes under the shared socket lease. It
+does not replace the full-kernel performance-equivalence gate.
 
 The subsequent full-scale publication correction passes **29 local tests**
 under Python 3.13.2, TVM 0.27.0.post1, and TIRx-kernels 0.1.2.post1:
@@ -121,13 +152,15 @@ epilogues, uneven work counts, and an alias-fence removal negative control.
 These tests run the committed kernel builder, not a GPU-only optimization
 prototype, and do not establish performance parity.
 
-A broader Linux Python run stopped after 564 passing cases because a worker's
+A prior broader Linux Python run stopped after 564 passing cases because a worker's
 memory use kept growing; this is not a full-suite pass. Isolated, identical
 reruns of
 `test_mega_moe_expert_parallel_has_no_stale_pool_alias_advisory` exceeded a
 12 GiB resident-memory limit in both the current tree and `13eeeca`. The
-complete Mega MoE analysis therefore remains unvalidated, rather than being
-classified as a passing test or a new release-RMW regression.
+complete Mega MoE analysis was therefore unvalidated at that point, rather than
+classified as a passing test or a new release-RMW regression. The October 14
+release-build correction and end-to-end passing results above supersede that
+blocker; the interrupted broader suite is still not a full-suite pass.
 
 The subsequent engine checks reproduced and corrected acceptance of invalid
 multimem specializations and stale provenance after unnamed writes. The nine
@@ -225,15 +258,16 @@ are historical reports; they have not been reproduced on this branch.
   shapes, both origins, and the independent repeat as recorded above. Rows
   identify ordering; the gate rejects unlabelled history, another mode's
   measurements, or choosing a different port configuration to hide overhead.
-- **Mega MoE's provenance correction needs an end-to-end rerun.** The prior
+- **Mega MoE's provenance correction passes its end-to-end rerun.** The prior
   result was `review` for one `alias_stale_read` advisory. Focused Rust
   regressions now verify invalidation of overwritten named provenance,
   including partial and sparse writes, without discarding earlier findings.
-  The full-kernel test now requires `clean`, but has not run with this change.
+  The full-kernel test now requires `clean` and passes after correcting the
+  independent release-build byte-occupancy mutation described above.
   The [provenance explanation](MULTI_GPU_PEER.md#shared-pool-alias-advisory) describes
-  the completed unnamed bulk-copy write and correction. Rerun the Linux alias
-  tests, peer kernels, wiki corpus, and relevant performance gates before
-  recording a clean result or revising corpus advisory goldens.
+  the completed unnamed bulk-copy write and correction. The focused alias and
+  peer-kernel checks pass. The broader wiki corpus and relevant performance
+  gates remain separate validation obligations.
 - **Coverage is bounded.** Async multimem copy/reduction/store families and
   fp8 forms are not modeled. The supported-operation table and rejection
   paths must stay consistent. The numerical model has GB200-specific floating

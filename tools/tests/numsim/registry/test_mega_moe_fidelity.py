@@ -67,6 +67,19 @@ def test_combine_load_sync_is_guarded_by_the_nonempty_mask(emitted):
         assert calls(guards[0], "T.cuda.warp_sync")
 
 
+def test_peer_offsets_are_selected_from_parameters_without_a_shared_cache(emitted):
+    _, tree = emitted
+    assert "smem_symm_rank_bases" not in ast.unparse(tree)
+    parameters = {argument.arg for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                  for argument in node.args.args}
+    assert {f"symm_rank_offset_{rank}" for rank in range(72)} <= parameters
+    if "symm_rank_offset_3" in {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}:
+        tables = [call for call in calls(tree, "T.Select")
+                  if any(isinstance(argument, ast.Name) and argument.id == "symm_rank_offset_3"
+                         for argument in call.args)]
+        assert len(tables) >= 8
+
+
 def test_unknown_ordering_is_rejected():
     with pytest.raises(ValueError, match="unsupported Mega MoE ordering"):
         kernel(ordering="unknown")
