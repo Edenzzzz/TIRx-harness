@@ -82,9 +82,11 @@ def load_acq_u32(dst, address):
 
 def wait_acq_u32(dst, address, predicate):
     """``ld.acquire.gpu.global.b32`` in a do-while, as the loop spelled it."""
-    return txl.cuda.wait_until(
-        dst, address, predicate, scope="gpu", ptx_type="b32"
-    )
+    with txl.While(True):
+        txl.ptx.ld.acquire.gpu.global_.b32(dst, address)
+        condition = predicate(dst) if callable(predicate) else predicate
+        with txl.If(condition), txl.Then():
+            txl.Break()
 
 
 def grid_sync_done_u32(new_value, old_value):

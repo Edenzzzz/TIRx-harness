@@ -22,8 +22,8 @@ The current audit found:
 |---|---|
 | Two-shot all-reduce | Preserves the baseline's data layout, constexpr loop/rank, and terminal release/relaxed-CAS protocol. All 18 shapes and the independent repeat now pass bitwise equality, independent-reference precision, flag reset, and the unchanged 99% performance gate. |
 | GEMM + all-reduce | Restored baseline waits, elected leaders, and barrier sequence; removed the added exit GPU fence. All 19 shapes, both origins, three matched configurations, and the independent repeat now meet the unchanged precision/performance gate. `sys_fenced` remains a separate semantic example. |
-| All-gather GEMM | `benchmarks.peer.fidelity` restores CUTLASS's per-shard launches, exact auxiliary kernels, and common host schedule. The components pass numerical simulation; the full GPU parity matrix remains open. The earlier fused/chunked and NumSim copy-warp variants are separate examples, not fidelity evidence. |
-| Mega MoE | The default restores the audited 60-second timeout paths, volatile/readonly loads, combine work partition, relaxed cluster arrival, TMEM release placement, and barrier/fence sequence. `sys_fenced` is an explicit separate semantic example. IR contracts pass; remaining generated-code and GPU comparison against the pinned source stay open. |
+| All-gather GEMM | `benchmarks.peer.fidelity` restores CUTLASS's per-shard launches, exact auxiliary kernels, and common host schedule. Both 17-shape GPU rounds pass bitwise/reference correctness and the 99% gate at baseline-selected configurations; worst ratios are 1.001948 / 1.002322. The earlier fused/chunked and NumSim copy-warp variants are separate examples, not fidelity evidence. |
+| Mega MoE | The default restores the audited 60-second timeout paths, volatile/readonly loads, combine work partition, relaxed cluster arrival, TMEM release placement, and barrier/fence sequence. `sys_fenced` is an explicit separate semantic example. All 14 shapes pass bitwise output/statistics checks; the same-GB200 repeat still misses the 99% gate for one-token `dsv3_t1` (1.0444x; the independent B300 first check was 1.0314x). Generated-code capture shows equal 128-register/1024-byte-shared resource use but about 31% more SASS instructions, so the remaining issue is generic TIRx lowering/codegen fixed overhead—not permission to change the kernel schedule or use faster instructions. |
 
 Actual CUTLASS and FlashInfer PTX/CUBIN and TIRx CUBIN were captured with the
 existing compiler under the socket lease. The CUTLASS artifact confirms elected
@@ -58,13 +58,17 @@ surface tests**. Five partial-CTA GPU microtests pass under the socket lease.
 These results cover the actual one-thread helper kernels, without changing
 their launch geometry. Partial-CTA collectives remain explicitly unsupported.
 
+The faithful all-gather GPU matrix now has **17 shapes × 8 matched CUTLASS
+configurations × 2 rounds** with all rows numerically correct; the
+baseline-selected worst ratios are **1.001948 / 1.002322**.
+
 After the ABI update, **138 additional targeted tests pass** for the complete
 GEMM numerical/race/sync matrix, IR contracts, support-table generation, and
 benchmark evidence gates. The faithful all-gather GPU probe matches CUTLASS
 bitwise and measures 47.54 versus 47.55 microseconds at the same configuration;
-the full shape/configuration matrix and repeat are still running. Nine Mega
-MoE IR checks retain per-token serial chunks and distinguish baseline timeout,
-load, and fence forms from the separate strengthened example.
+the full shape/configuration matrix and repeat are complete. Nine Mega MoE IR
+checks retain per-token serial chunks and distinguish baseline timeout, load,
+and fence forms from the separate strengthened example.
 
 The pinned DeepGEMM reference builds with its original kernels and submodules
 (`559d79f`, CUTLASS `f3fde583`, fmt `553ec11`). PyTorch 2.14 requires a C++20

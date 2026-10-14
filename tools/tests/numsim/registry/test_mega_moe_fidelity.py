@@ -35,6 +35,7 @@ def test_default_port_retains_timeouts_and_reference_memory_forms(emitted):
     assert any("nc" in modifiers(call) for call in calls(tree, "T.ptx.ld"))
     if mode == "origin":
         assert any("volatile" in modifiers(call) for call in calls(tree, "T.ptx.ld"))
+        assert not calls(tree, "T.cuda.wait_until")
     global_fences = [call for call in calls(tree, "T.ptx.fence")
                      if modifiers(call) == ("proxy", "async", "global", "")]
     assert bool(global_fences) == (mode == "sys_fenced")

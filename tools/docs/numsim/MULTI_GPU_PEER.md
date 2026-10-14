@@ -95,6 +95,14 @@ and ordering examples in `tests/numsim/support/peer_mega_moe.py` explicitly use
 port instead. Neither IR assertions nor the historical strengthened timings
 establish current Mega MoE GPU parity.
 
+The current GPU Mega MoE screen covers all 14 requested shapes with exact
+output/statistics equality. The same-GB200 repeat misses only `dsv3_t1` at
+1.0444x (the independent B300 first check was 1.0314x). A dsv3_t1 capture has
+the same 128 registers and 1024-byte shared allocation as DeepGEMM, but the
+TIRx cubin contains about 31% more SASS instructions. The remaining work is to
+remove generic frontend/codegen overhead while preserving the reference
+instructions and schedule; it is not a kernel-specific retune.
+
 `tests/numsim/runtime/test_partial_cta.py` and the matching GPU microtests check
 exact thread counts, divergent scalar paths, and untouched absent lanes.
 The Racecheck/Synccheck `test_partial_cta.py` cases exercise those same launch
@@ -638,11 +646,12 @@ A ratio is TIRx's latency over the origin's, so the bar is a ratio of at most
 
 ### Mega MoE
 
-Every shape meets the bar in both runs; the worst ratio is 1.004. On every
-shape, the output and the cumulative expert statistics equal DeepGEMM's bit
-for bit. Both runs are of the same source (digest `31284daeef41759a`). The
-table is transcribed from an external run; the commands above regenerate the
-JSONL outputs locally when a worker is available.
+The current faithful screen checks all 14 shapes for exact output and
+cumulative-statistics equality. The same-GB200 repeat misses the bar only for
+`dsv3_t1` (1.0444x); the independent B300 first check was 1.0314x. The older
+table below is retained as historical cross-implementation evidence, not as
+validation of the current baseline-faithful port. The commands above regenerate
+raw JSONL outputs locally when a worker is available.
 
 | Shape | Tokens per rank | Hidden, I | Experts, top-k, shared | DeepGEMM (us) | TIRx (us) | Ratio | Repeat ratio |
 |---|---:|---|---|---:|---:|---:|---:|
