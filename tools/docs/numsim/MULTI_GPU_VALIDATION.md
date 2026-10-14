@@ -102,6 +102,13 @@ retained; incomplete files and failure logs are preserved separately while
 only unfinished comparisons resume under the same socket lease and unchanged
 99% gate. The earlier 943 CPU and 94 GPU passing runs remain separate evidence.
 
+After recovery, the final-source Mega MoE first round passes all 14 shapes
+with bitwise-equal output/statistics; its worst latency ratio is 1.0044118.
+The independent `dsv3_t1` repeat is 1.0134496 (98.183 versus 96.880 microseconds)
+and still fails the 99% gate. Keep that miss distinct from an unrelated
+`EADDRINUSE` startup failure: the latter's missing measurement is retried,
+whereas the performance miss remains recorded for further lowering work.
+
 ## Historical evidence
 
 After the ABI update, **138 additional targeted tests pass** for the complete

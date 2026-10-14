@@ -168,6 +168,13 @@ All 14 shapes are prepared under a separate immutable compiler snapshot; the
 complete matrix and independent repeat are running. This first result is not
 a full-parity claim.
 
+The final-source first matrix now passes all 14 shapes, with a worst ratio of
+1.0044118x (`dsv3_t1`) and bitwise-equal output/statistics. The independent
+one-token repeat is 98.183/96.880 microseconds (1.0134496x), outside the
+unchanged 99% gate. That is a performance miss, not the separate rendezvous
+port collision; its row is retained and needs further lowering analysis.
+The other repeat and compiler-regression cases continue under the GPU lease.
+
 ## Regression tests
 
 The patch adds code-generation checks for a dynamic serial loop, a static
