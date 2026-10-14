@@ -1671,13 +1671,17 @@ def get_kernel(
         def scheduler_release_task_info():
             # `release_task_info`: all epilogue threads (both CTAs) arrive at the
             # leader CTA's empty barrier of the just-consumed stage.
-            _rem1 = txl.local_scalar("uint64")
-            txl.ptx.mapa.shared__cluster.u64(
+            _rem1 = txl.local_scalar("uint32")
+            txl.ptx.mapa.shared__cluster.u32(
                 _rem1,
-                task_info_empty_barriers.ptr_to([sched_state.stage ^ txl.int32(1)]),
+                txl.cuda.cvta_generic_to_shared(
+                    task_info_empty_barriers.ptr_to([sched_state.stage ^ txl.int32(1)])
+                ),
                 txl.uint32(0),
             )
-            txl.ptx.mbarrier.arrive.b64(_rem1, txl.uint32(1), pred=txl.bool(True))
+            txl.ptx.mbarrier.arrive.shared__cluster.b64(
+                _rem1, txl.uint32(1), pred=txl.bool(True)
+            )
 
         def producer_create_task(task_block_phase, task_num_clusters, task_shape_n, task_shape_k):
             # `create_task`: resolve the owning expert / m-block / valid_m of the
@@ -1861,11 +1865,15 @@ def get_kernel(
             # the consumer through st.async's complete_tx, and `.release.cluster`
             # costs a GPU-scope membar on every published task.
             with txl.If(lane_idx < txl.int32(2)), txl.Then():
-                _rem_ti = txl.local_scalar("uint64")
-                txl.ptx.mapa.shared__cluster.u64(
-                    _rem_ti, task_info_full_barriers.ptr_to([sched_state.stage]), txl.uint32(lane_idx)
+                _rem_ti = txl.local_scalar("uint32")
+                txl.ptx.mapa.shared__cluster.u32(
+                    _rem_ti,
+                    txl.cuda.cvta_generic_to_shared(
+                        task_info_full_barriers.ptr_to([sched_state.stage])
+                    ),
+                    txl.uint32(lane_idx),
                 )
-                txl.ptx.mbarrier.arrive.expect_tx.b64(
+                txl.ptx.mbarrier.arrive.expect_tx.shared__cluster.b64(
                     _rem_ti, txl.uint32(task_info_bytes), pred=txl.bool(True)
                 )
                 st_async_cluster_task_info(
@@ -1946,9 +1954,13 @@ def get_kernel(
             txl.cuda.mbarrier_wait(barrier_ptr, phase)
 
         def tmem_empty_barrier_arrive_cta0(tmem_empty_barrier_ptr):
-            _rem2 = txl.local_scalar("uint64")
-            txl.ptx.mapa.shared__cluster.u64(_rem2, tmem_empty_barrier_ptr, txl.uint32(0))
-            txl.ptx.mbarrier.arrive.b64(_rem2, txl.uint32(1), pred=txl.bool(True))
+            _rem2 = txl.local_scalar("uint32")
+            txl.ptx.mapa.shared__cluster.u32(
+                _rem2, txl.cuda.cvta_generic_to_shared(tmem_empty_barrier_ptr), txl.uint32(0)
+            )
+            txl.ptx.mbarrier.arrive.shared__cluster.b64(
+                _rem2, txl.uint32(1), pred=txl.bool(True)
+            )
 
         def umma_arrive_multicast_2x1sm(barrier_ptr):
             with txl.If(txl.cuda.elect_sync()), txl.Then():
@@ -2068,9 +2080,13 @@ def get_kernel(
             )
 
         def full_barrier_arrive_cta0(full_barrier_ptr):
-            _rem3 = txl.local_scalar("uint64")
-            txl.ptx.mapa.shared__cluster.u64(_rem3, full_barrier_ptr, txl.uint32(0))
-            txl.ptx.mbarrier.arrive.b64(_rem3, txl.uint32(1), pred=txl.bool(True))
+            _rem3 = txl.local_scalar("uint32")
+            txl.ptx.mapa.shared__cluster.u32(
+                _rem3, txl.cuda.cvta_generic_to_shared(full_barrier_ptr), txl.uint32(0)
+            )
+            txl.ptx.mbarrier.arrive.shared__cluster.b64(
+                _rem3, txl.uint32(1), pred=txl.bool(True)
+            )
 
         def make_instr_desc_block_scaled():
             txl.cuda.tcgen05.encode_instr_descriptor_block_scaled(

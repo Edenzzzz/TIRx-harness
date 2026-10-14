@@ -143,6 +143,12 @@ The other three kernels' compiler-regression matrices also pass both rounds.
 These results require the patched compiler and do not establish parity for
 the unpatched dependency.
 
+The subsequent reference-form correction uses 32-bit mapped shared addresses
+and explicit shared-cluster arrivals, as the pinned CUTLASS implementation
+does. It passes 82 focused checks and both one-token GPU comparisons, but
+the tiny-shape repeat remains outside 99% at 1.0256084x. This is a retained
+performance miss, not a clean full-matrix result.
+
 `tests/numsim/runtime/test_partial_cta.py` and the matching GPU microtests check
 exact thread counts, divergent scalar paths, and untouched absent lanes.
 The Racecheck/Synccheck `test_partial_cta.py` cases exercise those same launch

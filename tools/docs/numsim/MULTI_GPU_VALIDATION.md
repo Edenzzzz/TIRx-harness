@@ -212,6 +212,16 @@ fidelity/parity gate and are not reported as a passing package suite.
 
 ## Historical evidence
 
+The latest port correction restores the pinned reference's 32-bit shared
+mapping and explicit shared-cluster barrier-arrival forms at four helper
+sites, without strengthening the release scope or changing work/scheduling.
+Source `979bd32f26952708` passes 82 focused checks and two one-token GPU
+comparisons at 1.0000308 / 1.0032366, with exact output/statistics. The tiny
+case passes first at 0.9891977 but misses its repeat at **1.0256084**
+(33.001/32.177 microseconds). Full parity remains open. The
+[lowering evidence](lowering/README.md#restoring-reference-shared-address-forms)
+records the exact reference, disassembly delta, and all four comparisons.
+
 After the ABI update, **138 additional targeted tests pass** for the complete
 GEMM numerical/race/sync matrix, IR contracts, support-table generation, and
 benchmark evidence gates. The faithful all-gather GPU probe matches CUTLASS

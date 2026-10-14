@@ -4,6 +4,8 @@ import ast
 import inspect
 
 import pytest
+import tvm
+import tvm_ffi
 
 from ported.deepgemm._sm100_fp8_fp4_mega_moe.kernel import get_kernel
 from tests.numsim.support.peer_mega_moe import Shape, kernel
@@ -86,3 +88,28 @@ def test_peer_offsets_are_selected_from_parameters_without_a_shared_cache(emitte
 def test_unknown_ordering_is_rejected():
     with pytest.raises(ValueError, match="unsupported Mega MoE ordering"):
         kernel(ordering="unknown")
+
+
+@pytest.mark.parametrize("world,ordering", [(world, mode) for world in (1, 4)
+                                          for mode in ("origin", "sys_fenced")])
+def test_remote_barrier_addresses_retain_the_references_shared_u32_forms(world, ordering):
+    shape = Shape(world=world, num_tokens=(4,) * world, hidden=7168, intermediate_hidden=2048)
+    function = kernel(shape, ordering=ordering)
+    instructions = []
+    tvm_ffi.structural_walk(
+        function.body,
+        (tvm.ir.Call, lambda call: instructions.append(call)
+         if isinstance(call.op, tvm.ir.Op) else None),
+    )
+    mappings = [call for call in instructions if call.op.name.startswith("tirx.ptx.mapa")]
+    assert mappings
+    assert all(call.op.name == "tirx.ptx.mapa_u32" for call in mappings)
+    arrivals = [call for call in instructions if "ptx.mbarrier_arrive" in call.op.name]
+    qualifiers_by_call = [tuple(str(argument.value) for argument in call.args
+                               if isinstance(argument, tvm.ir.StringImm))
+                          for call in arrivals]
+    assert sum("shared::cluster" in qualifiers for qualifiers in qualifiers_by_call) >= 3
+    for qualifiers in qualifiers_by_call:
+        assert any(value in {"shared", "shared::cta", "shared::cluster"} for value in qualifiers)
+        assert "release.cluster" not in qualifiers
+        assert not ("release" in qualifiers and "cluster" in qualifiers)

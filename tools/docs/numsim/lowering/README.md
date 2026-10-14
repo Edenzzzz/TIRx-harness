@@ -260,6 +260,36 @@ CUDA, host LLVM IR, and serialized device/launch metadata between their
 measured compiler and the final compiler. Every corresponding file is
 byte-identical; the later array/register passes do not change those ports.
 
+### Restoring reference shared-address forms
+
+The pinned DeepGEMM CUTLASS header at
+`f3fde58372d33e9a5650ba7b80fc48b3b49d40c8` uses
+`mapa.shared::cluster.u32` followed by `mbarrier.arrive[.expect_tx].shared::cluster.b64`
+in `ClusterBarrier::arrive` and `ClusterTransactionBarrier::arrive_and_expect_tx`.
+Four port helpers instead widened the mapped address to 64 bits and used
+generic-address arrivals. They now retain the reference's 32-bit shared forms.
+This restores existing reference instructions; it adds no new instruction,
+release scope, barrier, work partition, or scheduling pattern.
+
+The new source stamp is `979bd32f26952708`. The one-token cubin falls from
+4064 to 4000 instructions without statistics, and from 4080 to 4016 with
+statistics. All seven `SR_SWINHI` reads disappear; registers, stack, and static
+shared memory remain 128, 32 bytes, and 1024 bytes. These are disassembly
+observations, not hardware stall or utilization claims. All 82 focused
+fidelity/peer numerical/race/sync checks pass, including emitted-IR checks for
+32-bit mapping and explicit shared arrival spaces.
+
+The unchanged 11-round GPU comparison gives:
+
+| Shape | First TIRx / reference microseconds | First ratio | Repeat TIRx / reference microseconds | Repeat ratio |
+|---|---:|---:|---:|---:|
+| `dsv3_t1` | 97.348 / 97.345 | 1.0000308 | 98.569 / 98.251 | 1.0032366 |
+| `port_t2_h1024_e8_k1` | 33.241 / 33.604 | 0.9891977 | 33.001 / 32.177 | 1.0256084 |
+
+Every output and statistic matches exactly. The tiny-shape repeat still
+fails the unchanged 99% gate, so this correction does not close full parity.
+The old misses remain recorded; further lowering investigation is required.
+
 ### Timeline evidence
 
 Four-rank IKET captures retain the original work assignment. The cold capture
