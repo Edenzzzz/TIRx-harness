@@ -247,8 +247,18 @@ with bitwise-equal output/statistics. The worst ratios are 1.0085679x
 | `port_t64_e384_k6` | 556.477 / 556.605 | 0.9997700 | 554.103 / 553.822 | 1.0005074 |
 | `port_t8192_e384_k6` | 2395.000 / 2396.000 | 0.9995826 | 2392.000 / 2396.000 | 0.9983306 |
 
-These full final-source rounds establish the Mega MoE performance gate, not
-the preceding failed prototypes or reduced static instruction count alone.
+Those rounds pass their full gate, unlike the preceding failed prototypes.
+A subsequent revalidation with the final runtime records a new one-token miss:
+**98.793/97.277 microseconds (1.0155844x)**, with exact output/statistics.
+The final 28 CUDA images are byte-identical to the passing build, so static
+instruction count alone does not explain this discrepancy. This new miss is
+retained, and full parity remains open while the complete final-runtime matrix
+and independent repeat run.
+
+A separate 802-function audit of the other three kernels compares generated
+CUDA, host LLVM IR, and serialized device/launch metadata between their
+measured compiler and the final compiler. Every corresponding file is
+byte-identical; the later array/register passes do not change those ports.
 
 ### Timeline evidence
 
@@ -308,7 +318,11 @@ Rust suites pass 890 unit,
 four checker-import, and three public-surface tests. The earlier ABI 41 run
 passes 943 multimem/peer numerical, ordering-rule, and registry/ABI tests;
 all 94 live multimem GPU microtests pass with no skips under a four-GPU socket
-lease. Those earlier broad runs remain distinct from the final ABI 42 rerun.
+lease. The final ABI 42 feature rerun passes 972 tests; the final compiler's
+99-case GPU rerun covers all 94 multimem cases and five partial-CTA cases,
+with no skips. Source-to-wheel installation and numerical smoke checks pass
+for both current and compatible-parent trees. The separate broad-suite
+failures and unchanged CPU-budget misses remain in the validation audit.
 The focused command is:
 
 ```bash

@@ -151,6 +151,19 @@ output/statistics equality and the unchanged 99% gate. Worst ratios are
 36.158/38.252 and 36.249/37.062. Earlier prototype misses remain recorded in
 the [lowering evidence](lowering/README.md#evidence), not relabelled as passes.
 
+The subsequent final-runtime revalidation reopens the Mega MoE gate: its first
+one-token comparison is **98.793/97.277 microseconds (1.0155844x)**, despite
+exact output/statistics and byte-identical CUDA images. The other cases and
+independent repeat continue in separate files. The preceding passing rounds
+do not erase this miss or establish current full parity.
+
+For the other three kernels, an additional complete compiler-output audit
+compares all **802** rank/configuration functions between their measured
+compiler and the final compiler: **CUDA source, host LLVM IR, and serialized
+device/launch metadata are byte-identical**. Coverage is 456 GEMM/all-reduce,
+274 all-gather including its helpers, and 72 two-shot functions. No later
+parameter-array or register simplification silently changes those ports.
+
 NumSim ABI **42** snapshots by-value arrays per rank, preserving that policy
 through native checker bindings, artifact manifests, and cache identity.
 The ABI 42 run passes **106** combined peer numerical/race/sync, parameter,
@@ -176,12 +189,26 @@ tests. Three compiler layout negative controls fail before their fix and pass
 afterward. The 59 simplifier tests and both source-generation PTX controls
 also pass; the latter use source-only fallback, not a newer assembler.
 
-The broad run's 149.860-second NumSim maximum-case miss remains recorded
-against the unchanged 140-second CPU budget. Archive version metadata and
-Rust compiler stack exhaustion are separate infrastructure failures. A serial,
-like-for-like rerun of the remaining failures against compatible parent
-`ee1d815`, with identical environment fixes, and the final live GPU rerun are
-in progress. No timing threshold is widened to make this run green.
+The final ABI 42 feature matrix passes **972 tests in 203.04 seconds**,
+including all multimem/peer numerical and ordering rules, registry/ABI checks,
+and by-value parameter tests. The final compiler's live rerun passes **99 GPU
+microtests in 415.11 seconds**: all 94 multimem cases and five partial-CTA
+cases, with four pytest workers under one four-GPU socket lease. All 15
+focused compiler GPU cases pass again. Both the current and compatible-parent
+source-to-wheel/install/numerical-smoke tests pass after restoring real Git
+metadata, the pinned exported dependency revision, and the required `pip`.
+
+The broader CPU gate is still not green. Serial identical-node comparisons
+against compatible parent `ee1d815` reproduce ten unsupported-host-`Evaluate`
+cases, three stale `cu` bindings, four Rust/LLVM compiler crashes, and the
+maximum NumSim CPU-budget failure. That case takes **167.457 / 167.050 seconds**
+(current/parent), above the unchanged 140-second budget; the original
+149.860-second miss also remains recorded. All six corrected canonical checker
+performance cases execute cleanly and complete all tasks; five pass their CPU
+budgets, while the medium case takes **17.641 seconds** against 16.7. The
+parent's recorded medium-case time is 16.746 seconds, also above that cap.
+No threshold is widened. These CPU limits are separate from the GPU
+fidelity/parity gate and are not reported as a passing package suite.
 
 ## Historical evidence
 

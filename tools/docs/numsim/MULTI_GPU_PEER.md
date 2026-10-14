@@ -136,6 +136,9 @@ equality and a worst ratio of 1.0092574x (`dsv3_t1`). The independent repeat's
 one-token result is 1.0106940x, outside the 99% gate; parity remains incomplete.
 The replacement by-value-array port passes all 14 shapes in both final-source
 rounds, with worst ratios of 1.0085679x / 1.0034897x and exact output/statistics.
+The subsequent final-runtime one-token comparison is 1.0155844x with exact
+output/statistics, so the current Mega MoE parity gate remains open. Earlier
+passing rounds do not erase that new miss.
 The other three kernels' compiler-regression matrices also pass both rounds.
 These results require the patched compiler and do not establish parity for
 the unpatched dependency.
