@@ -50,6 +50,23 @@ def test_combine_keeps_chunks_serial_within_each_tokens_warp(emitted):
     assert any(ast.unparse(loop.iter) == "range(2)" for loop in enclosing)
 
 
+def test_combine_load_sync_is_guarded_by_the_nonempty_mask(emitted):
+    _, tree = emitted
+    additions = [call for call in calls(tree, "T.ptx.add") if "bf16" in modifiers(call)]
+    chunk_loop = next(node for node in ast.walk(tree) if isinstance(node, ast.For)
+                      and ast.unparse(node.iter) == "range(2)"
+                      and all(call in list(ast.walk(node)) for call in additions))
+    copies = calls(chunk_loop, "T.ptx.cp")
+    loads = [call for call in copies if "mbarrier::complete_tx::bytes" in modifiers(call)]
+    assert len(loads) == 2
+    for load in loads:
+        guards = [node for node in ast.walk(chunk_loop) if isinstance(node, ast.If)
+                  and load in list(ast.walk(node))
+                  and not calls(node.test, "T.cuda.elect_sync")]
+        assert len(guards) == 1
+        assert calls(guards[0], "T.cuda.warp_sync")
+
+
 def test_unknown_ordering_is_rejected():
     with pytest.raises(ValueError, match="unsupported Mega MoE ordering"):
         kernel(ordering="unknown")

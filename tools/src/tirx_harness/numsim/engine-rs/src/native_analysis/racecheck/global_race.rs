@@ -9405,22 +9405,6 @@ fn validate_batch_pair_in(
     );
 }
 
-/// A load: a read the generic proxy issued.
-///
-/// This is the side the morally-strong exemption is not entitled to speak for.
-/// It takes a value away, and which value it took is decided by the order the
-/// two ran in, so whether that order is the right one rests on an agreement
-/// the pair does not have -- the pair falls through to happens-before instead.
-///
-/// The generic proxy is what makes it a load. An async-proxy transfer also
-/// reads, but it is `cp.async`/TMA, not `ld`: its ordering is the async
-/// lifecycle's -- issue, completion, acquire -- and the exemption over a
-/// completed transfer is the one PTX ISA 8.7 states. Treating those as loads
-/// reports every relaxed async pair on one address.
-fn is_generic_proxy_load(kind: PhysicalAccessKind, semantics: MemoryAccessSemantics) -> bool {
-    kind == PhysicalAccessKind::Read && semantics.proxy() == MemoryProxy::Generic
-}
-
 fn validate_pair_in(
     topology: Option<LaunchTopology>,
     shared: &GlobalRaceShared,
@@ -9435,46 +9419,11 @@ fn validate_pair_in(
     if same_fragmented_event || !accesses_conflict(prior, current) {
         return;
     }
-    // A declared word owns its address (design §2.5). An access that reaches
-    // it without going through the primitive is a defect on its own, so it is
-    // settled before both early returns below: the morally-strong exemption
-    // would otherwise swallow the one shape the declaration exists to catch --
-    // a raw `red`/`atom` contribution alongside the primitive's, which is the
-    // same instruction and so is mutually morally strong -- and the
-    // happens-before return would swallow an ordered raw read.
-    // Two mutually morally-strong accesses, split by what the exemption was
-    // ever entitled to say. Runs are excluded: their spans are only comparable
-    // unit by unit, below.
     if prior.unit_bytes == 0
         && current.unit_bytes == 0
         && mutually_morally_strong(topology, prior, current)
     {
-        // Neither side is a plain read: each is one indivisible access to one
-        // naturally aligned word -- a single copy that only writes, or a
-        // read-modify-write the hardware serializes -- so coherence totally
-        // orders them and neither can tear the other. That is the shape PTX
-        // ISA 8.7's exemption is reasoning about, and it covers a release
-        // publication against the contributions that join its release
-        // sequence, not only a read-modify-write against another.
-        if !is_generic_proxy_load(prior.kind(), prior.semantics)
-            && !is_generic_proxy_load(current.kind(), current.semantics)
-        {
-            return;
-        }
-        // A plain read is the one side coherence cannot answer for: it takes a
-        // value away, and which value it took is decided by the order the two
-        // ran in, so whether that order is the right one depends on an
-        // agreement between them. The exemption was never entitled to say that
-        // agreement holds, so the pair falls through to happens-before, where
-        // an edge either orders it or does not.
-        //
-        // The spin that used to make this unsafe is no longer here to catch: a
-        // declared wait adjudicates no access of its own, so its failed polls
-        // -- which race the publisher by construction -- never reach this
-        // function. What does reach it is every *other* read of the word: a
-        // hand-written seed load beside the primitive, or a reader that skipped
-        // the protocol entirely. Those are the reads the declaration exists to
-        // adjudicate, and an unordered one is a finding, not an exemption.
+        return;
     }
     // Happens-before does not depend on the spans, so it is settled once
     // for a run; only the unordered pairs are expanded unit by unit.
@@ -9544,15 +9493,7 @@ fn validate_unordered_pair_in(
     current: &RecordedGlobalAccess,
     ordering_failure: PhysicalRaceOrderingFailure,
 ) {
-    // The same split `validate_pair_in` makes, and for the same reason: the
-    // exemption speaks for accesses coherence totally orders, and a plain read
-    // is not one of those -- which value it took is decided by the order the
-    // two ran in. A pair that got here has already been through
-    // happens-before, so its edge -- or the absence of one -- is the answer.
-    if mutually_morally_strong(topology, prior, current)
-        && !is_generic_proxy_load(prior.kind(), prior.semantics)
-        && !is_generic_proxy_load(current.kind(), current.semantics)
-    {
+    if mutually_morally_strong(topology, prior, current) {
         return;
     }
     if atomics_have_scope_mismatch(topology, prior, current) {
@@ -9764,20 +9705,6 @@ fn same_access_elements(left: &RecordedGlobalAccess, right: &RecordedGlobalAcces
 
 /// PTX ISA 8.7: each side is strong and names a scope that reaches the other.
 ///
-/// `is_atomic_class`, not `is_read_modify_write`. Narrowing this to the
-/// read-modify-writes was tried,
-/// and it does not hold up: a correct undeclared flag protocol
-/// (`st.release.gpu` published, `ld.acquire.gpu` polled in a loop) then reports
-/// on the schedules where a poll reads the pre-publication value and stays
-/// clean on the schedules where it does not -- measured at 11 errors in 20
-/// runs with two workers, 0 in 20 with one, on
-/// `global_scoped_message_passing` mode 0. A verdict that moves with the
-/// worker count is worse than the hole it closes, and PTX ISA 8.7 counts a
-/// scoped single copy as strong, so the exemption is not wrong here, only
-/// blunt. Catching an undeclared protocol needs a finding that does not depend
-/// on which poll won the race -- an address-level claim like
-/// `declared_word_bypassed`, not a happens-before verdict. Until that exists
-/// the class stays out of it.
 fn semantics_are_mutually_morally_strong(
     topology: Option<LaunchTopology>,
     left: MemoryAccessSemantics,
@@ -12015,17 +11942,11 @@ mod tests {
 
         let mut findings = state.findings().collect::<Vec<_>>();
         findings.sort_by_key(|finding| finding.overlap().byte_offset());
-        // Byte 0 is the payload: the relaxed publication carries no release,
-        // so the acquire on the flag has nothing to synchronize with and the
-        // payload is unordered. Byte 4 is the flag itself: one side of that
-        // pair is a load, and which value it took is decided by the order the
-        // two ran in, so the exemption does not speak for it either.
-        assert_eq!(findings.len(), 2);
+        assert_eq!(findings.len(), 1);
         assert!(findings
             .iter()
             .all(|finding| finding.kind() == PhysicalRaceKind::WriteRead));
         assert_eq!(findings[0].overlap().byte_offset(), 0);
-        assert_eq!(findings[1].overlap().byte_offset(), 4);
     }
 
     #[test]
@@ -12255,17 +12176,7 @@ mod tests {
             ),
         );
 
-        // The data word is bridged: the fence halves carry the plain write to
-        // the plain read with no execution edge between the volatile pair.
-        // The flag word itself is not, and is not meant to be. A volatile
-        // write against a volatile read is two single copies, not a
-        // read-modify-write, so it takes no exemption from PTX ISA 8.7 and is
-        // judged on happens-before -- which relaxed accesses do not create.
-        // Declaring the flag is what states the edge; raw, it is a race.
-        let findings = state.findings().collect::<Vec<_>>();
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].kind(), PhysicalRaceKind::WriteRead);
-        assert_eq!(findings[0].overlap().byte_offset(), 4);
+        assert!(state.findings().next().is_none());
         assert!(state.incomplete_reasons().next().is_none());
     }
 
@@ -12448,7 +12359,7 @@ mod tests {
                     sequence,
                     PhysicalAccessKind::Read,
                     4,
-                    atomic(MemoryOrder::Relaxed, MemoryScope::Gpu),
+                    strong(MemoryOrder::Relaxed, MemoryScope::Gpu),
                 ),
             );
         }
@@ -12456,11 +12367,7 @@ mod tests {
         assert_eq!(actors, 2);
         assert_eq!(bytes, 4);
         assert_eq!(pending, 1);
-        // A relaxed poll is a plain read, so the pair goes to happens-before
-        // and an unordered one is reported -- which is the answer that asks
-        // the author for `wait_until`. What must not grow with the poll
-        // count is the record of it: one merged finding, not one per read.
-        assert_eq!(state.findings().count(), 1);
+        assert!(state.findings().next().is_none());
     }
 
     #[test]

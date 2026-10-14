@@ -44,6 +44,9 @@ shared memory, barriers, and grid coordinates.
 2. **Physical conflicts:** Racecheck checks overlapping bytes, not equality
    of parameter names. Unordered read/write, write/write, and reuse-after-read
    accesses need a causal dependency or applicable strong-access atomicity.
+   Same-element strong loads and stores/RMWs whose scopes cover one another
+   are exempt from data races even if a poll sees the initial flag value.
+   That exemption does not publish or acquire unrelated payload bytes.
    A successful numerical result cannot substitute for that dependency.
 3. **Scope and observation:** release and acquire patterns must both cover
    the communicating threads; across GPUs that requires `.sys`. The acquire
@@ -74,11 +77,20 @@ The tables below pair these rules with positive controls and counterexamples.
 See the [PTX memory model](https://docs.nvidia.com/cuda/parallel-thread-execution/#memory-consistency-model)
 for the specification, and the
 [validation status and resume checklist](MULTI_GPU_VALIDATION.md) for existing
-measurements and outstanding gates. The prior Mega MoE run had one
-`alias_stale_read` advisory. The provenance correction passes focused Rust
-tests; its effect on the complete kernel still needs Linux validation.
+measurements and outstanding gates. The full four-rank strengthened Mega MoE
+example now passes numerical, synchronization, and race checks on Linux,
+including the shared-pool provenance invalidation. Release builds must execute
+the byte-occupancy clear independently of debug assertions.
 
 ## Related tests
+
+`tests/analysis_tools/racecheck/test_strong_flag_reads.py` checks strong
+relaxed/acquire polls against release stores and RMWs with one and two
+workers. Its unobserved-payload counterexample still requires a data-race
+finding. The release-build interval-map tests
+`clearing_a_range_removes_its_byte_occupancy` and
+`clearing_a_subrange_preserves_only_the_untouched_fragments` preserve the
+alias-provenance invalidation rule, including untouched bytes.
 
 The baseline-faithful all-gather components have separate coverage:
 `tests/numsim/runtime/test_all_gather_fidelity.py` executes gated/ungated
@@ -89,19 +101,22 @@ and launch contracts. These numerical checks do not declare the original
 relaxed protocol race-free or simulate the host copy-engine schedule.
 
 `tests/numsim/registry/test_mega_moe_fidelity.py` checks the restored reference
-timeout/load forms and serial chunks within each token's warp. The numerical
+timeout/load forms, serial chunks within each token's warp, and mask-guarded
+combine-load warp synchronization. The numerical
 and ordering examples in `tests/numsim/support/peer_mega_moe.py` explicitly use
 `ordering="sys_fenced"`; pass `ordering="origin"` to construct the unstrengthened
 port instead. Neither IR assertions nor the historical strengthened timings
 establish current Mega MoE GPU parity.
 
-The current GPU Mega MoE screen covers all 14 requested shapes with exact
-output/statistics equality. The same-GB200 repeat misses only `dsv3_t1` at
-1.0444x (the independent B300 first check was 1.0314x). A dsv3_t1 capture has
-the same 128 registers and 1024-byte shared allocation as DeepGEMM, but the
-TIRx cubin contains about 31% more SASS instructions. The remaining work is to
-remove generic frontend/codegen overhead while preserving the reference
-instructions and schedule; it is not a kernel-specific retune.
+The unpatched compiler missed the one-token GPU gate at 1.0444x. Its cubin
+contains 5944 instructions versus the reference's 5024, counting predicated
+instructions (the earlier 31% count was incomplete). The rebuilt generic
+[loop and coordinate lowering](lowering/README.md) reduces the count to 4104
+and passes all 14 shapes in the first GPU matrix, with exact output/statistics
+equality and a worst ratio of 1.0092574x (`dsv3_t1`). The independent repeat and
+the other kernels' compiler-regression matrices remain in progress. These
+results require the patched compiler and do not establish parity for the
+unpatched dependency.
 
 `tests/numsim/runtime/test_partial_cta.py` and the matching GPU microtests check
 exact thread counts, divergent scalar paths, and untouched absent lanes.

@@ -4210,7 +4210,7 @@ def get_kernel(
                             tma_load_1d(load_buffer_ptr, src_ptr, load_barrier_ptr, num_chunk_bytes)
                             mbarrier_arrive_and_set_tx(load_barrier_ptr, num_chunk_bytes)
                         txl.assign(combine_do_reduce, txl.int32(1))
-                    txl.cuda.warp_sync()
+                        txl.cuda.warp_sync()
                     with txl.While(combine_do_reduce != txl.int32(0)):
                         txl.assign(combine_next_do_reduce, txl.int32(0))
                         with txl.If(combine_slot_mask != txl.uint32(0)), txl.Then():
@@ -4237,7 +4237,7 @@ def get_kernel(
                                 )
                                 mbarrier_arrive_and_set_tx(load_barrier_ptr, num_chunk_bytes)
                             txl.assign(combine_next_do_reduce, txl.int32(1))
-                        txl.cuda.warp_sync()
+                            txl.cuda.warp_sync()
                         mbarrier_wait_phase(
                             combine_barriers.ptr_to([epilogue_warp_idx * 2 + combine_state.stage]),
                             combine_state.phase,

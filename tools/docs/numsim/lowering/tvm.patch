@@ -1,0 +1,178 @@
+diff --git a/src/backend/cuda/codegen/codegen_cuda.cc b/src/backend/cuda/codegen/codegen_cuda.cc
+index e7a06977c..382a67b87 100644
+--- a/src/backend/cuda/codegen/codegen_cuda.cc
++++ b/src/backend/cuda/codegen/codegen_cuda.cc
+@@ -206,6 +206,7 @@ class ThreadIdxExtractor : public tirx::StmtExprVisitor {
+   ffi::Optional<VisitInterrupt> Visit_(const AttrStmtNode* op) final {
+     if (op->attr_key == tirx::attr::thread_extent) {
+       IterVar iv = op->node.as_or_throw<IterVar>();
++      index_extents.insert_or_assign(iv->thread_tag, op->value.as_or_throw<PrimExpr>());
+       if (iv->var->name == "threadIdx.x" || iv->thread_tag == "threadIdx.x") {
+         threadIdx_x_ext = op->value.as_or_throw<PrimExpr>();
+       }
+@@ -229,6 +230,7 @@ class ThreadIdxExtractor : public tirx::StmtExprVisitor {
+   }
+
+  public:
++  std::unordered_map<std::string, PrimExpr> index_extents;
+   PrimExpr threadIdx_x_ext = IntImm::Int32(1);
+   PrimExpr threadIdx_y_ext = IntImm::Int32(1);
+   PrimExpr threadIdx_z_ext = IntImm::Int32(1);
+@@ -240,6 +242,7 @@ class ThreadIdxExtractor : public tirx::StmtExprVisitor {
+ void CodeGenCUDA::PrintExtraAttrs(const PrimFunc& f, std::ostream& os) {
+   auto extractor = ffi::make_object<ThreadIdxExtractor>();
+   extractor->Visit(f->body);
++  thread_index_extents_ = std::move(extractor->index_extents);
+   sym::Analyzer analyzer;
+   PrimExpr threadIdx_ext = analyzer->Simplify(
+       extractor->threadIdx_x_ext * extractor->threadIdx_y_ext * extractor->threadIdx_z_ext);
+@@ -361,6 +364,11 @@ void CodeGenCUDA::Dispatch_(const tirx::ForNode* op) {
+       stream << " " << count->value;
+     }
+     stream << "\n";
++  } else if (op->kind == tirx::ForKind::kSerial &&
++             (!op->extent.as<IntImmNode>() ||
++              tirx::ContainsNode<tirx::WhileNode>(op->body))) {
++    PrintIndent();
++    stream << "#pragma unroll 1\n";
+   }
+   PrintIndent();
+   std::string vid = AllocVarID(op->loop_var.get());
+@@ -399,6 +407,8 @@ void CodeGenCUDA::Dispatch_(const WhileNode* op) {
+ void CodeGenCUDA::BindThreadIndex(const IterVar& iv) {
+   TVM_FFI_ICHECK(!var_idmap_.count(iv->var.get()));
+   const auto& scope = runtime::ThreadScope::Create(iv->thread_tag);
++  std::string tag = iv->thread_tag;
++  std::string cached;
+   if (scope.IsClusterCtaIdx()) {
+     TVM_FFI_ICHECK_GE(scope.dim_index, 0);
+     TVM_FFI_ICHECK_LT(scope.dim_index, 3);
+@@ -415,10 +425,36 @@ void CodeGenCUDA::BindThreadIndex(const IterVar& iv) {
+                                    ";\" : \"=r\"(ctaid) :);\n"
+                                    "  return ctaid;\n"
+                                    "}\n");
+-    var_idmap_[iv->var.get()] = CastFromTo(func_name + "()", PrimType::UInt(32), iv->var.ty());
++    cached = name_supply_->FreshName(std::string("__tirx_cached_cluster_") + dim);
++    PrintIndent();
++    stream << "uint32_t " << cached << " = " << func_name << "();\n";
++  } else if (tag.rfind("threadIdx.", 0) == 0 || tag.rfind("blockIdx.", 0) == 0) {
++    TVM_FFI_ICHECK_GE(scope.dim_index, 0);
++    TVM_FFI_ICHECK_LT(scope.dim_index, 3);
++    const char dim = static_cast<char>('x' + scope.dim_index);
++    std::string reg = (tag.rfind("threadIdx.", 0) == 0 ? "tid." : "ctaid.");
++    reg += dim;
++    cached = name_supply_->FreshName(std::string("__tirx_cached_") +
++                                    (tag.rfind("threadIdx.", 0) == 0 ? "tid_" : "ctaid_") + dim);
++    PrintIndent();
++    stream << "uint32_t " << cached << ";\n";
++    PrintIndent();
++    stream << "asm volatile(\"mov.u32 %0, %%" << reg << ";\" : \"=r\"(" << cached << "));\n";
+   } else {
+     var_idmap_[iv->var.get()] = CastFromTo(iv->thread_tag, PrimType::UInt(32), iv->var.ty());
++    return;
++  }
++  if (in_kernel_launch_) {
++    auto extent = thread_index_extents_.find(tag);
++    if (extent != thread_index_extents_.end()) {
++      PrimExpr simplified = sym::Analyzer()->Simplify(extent->second);
++      if (const auto* constant = simplified.as<IntImmNode>(); constant && constant->value > 0) {
++        PrintIndent();
++        stream << "__builtin_assume(" << cached << " < " << constant->value << ");\n";
++      }
++    }
+   }
++  var_idmap_[iv->var.get()] = CastFromTo(cached, PrimType::UInt(32), iv->var.ty());
+ }
+
+ void CodeGenCUDA::PrintType(const PrimType& t, std::ostream& os) {  // NOLINT(*)
+diff --git a/src/backend/cuda/codegen/codegen_cuda.h b/src/backend/cuda/codegen/codegen_cuda.h
+index c7703f9e0..1a73b4ff5 100644
+--- a/src/backend/cuda/codegen/codegen_cuda.h
++++ b/src/backend/cuda/codegen/codegen_cuda.h
+@@ -108,6 +108,7 @@ class CodeGenCUDA final : public CodeGenC {
+   // This is only semantics-preserving for effectively 1-D clusters where the
+   // y/z cluster-CTA extents are both one.
+   bool cluster_cta_x_is_linear_rank_{false};
++  std::unordered_map<std::string, PrimExpr> thread_index_extents_;
+
+   // Whether the function being generated is a __global__ kernel entry
+   // (kDeviceKernelLaunch); __device__ subroutines return real values.
+diff --git a/tests/python/tirx/codegen/test_codegen_cuda.py b/tests/python/tirx/codegen/test_codegen_cuda.py
+index 04e872c83..724eaddc3 100644
+--- a/tests/python/tirx/codegen/test_codegen_cuda.py
++++ b/tests/python/tirx/codegen/test_codegen_cuda.py
+@@ -364,9 +364,7 @@ def test_tirx_cuda_kernel_return_zero_codegen_is_void_early_return():
+             A[bx] = A[bx] + 1
+
+     src, _ = _get_source(main)
+-    # The bounded blockIdx.x domain simplifies ``blockIdx.x >= 3`` to the
+-    # equivalent final-point predicate, including CUDA's explicit index cast.
+-    assert re.search(r"if \(\(\(int\)blockIdx\.x\) == 3\)", src)
++    assert re.search(r"if \(\(\(int\)__tirx_cached_ctaid_x\) == 3\)", src)
+     assert "return;" in src
+     assert "return 0;" not in src
+
+@@ -416,6 +414,63 @@ def test_serial_disable_unroll_pragma_immediately_precedes_dynamic_for():
+     assert re.search(r"#pragma unroll 1\s*for \(", src)
+
+
++@pytest.mark.parametrize("unroll_hint", [None, True, 2, False])
++def test_serial_dynamic_loop_preserves_explicit_unroll_policy(unroll_hint):
++    @T.prim_func
++    def main(A: T.Buffer((32,), "int32"), count: T.int32):
++        T.device_entry()
++        tx = T.thread_id([32])
++        for index in T.serial(count, unroll=unroll_hint):
++            A[tx] = A[tx] + index
++
++    src, _ = _get_source(main)
++    directive = {None: " 1", True: "", 2: " 2", False: " 1"}[unroll_hint]
++    assert re.search(rf"#pragma unroll{directive}\s*for \(", src)
++
++
++def test_serial_loop_with_dynamic_inner_loop_is_not_implicitly_unrolled():
++    @T.prim_func
++    def main(A: T.Buffer((32,), "int32"), count: T.int32):
++        T.device_entry()
++        tx = T.thread_id([32])
++        for index in T.serial(2):
++            while A[tx] < count:
++                A[tx] = A[tx] + 1
++            A[tx] = A[tx] + index
++
++    src, _ = _get_source(main)
++    assert re.search(r"#pragma unroll 1\s*for \(", src)
++
++
++def test_small_static_serial_loop_retains_cuda_compiler_unroll_choice():
++    @T.prim_func
++    def main(A: T.Buffer((32,), "int32")):
++        T.device_entry()
++        tx = T.thread_id([32])
++        for index in T.serial(4):
++            A[tx] = A[tx] + index
++
++    src, _ = _get_source(main)
++    assert "for (" in src
++    assert not re.search(r"#pragma unroll[^\n]*\s*for \(", src)
++
++
++@pytest.mark.parametrize("threads", [17, 32, 64])
++def test_native_execution_coordinates_are_cached_with_launch_bounds(threads):
++    @T.prim_func
++    def main(A: T.Buffer((3, threads), "int32")):
++        T.device_entry()
++        block = T.cta_id([3])
++        lane = T.thread_id([threads])
++        A[block, lane] = block * threads + lane
++
++    src, _ = _get_source(main)
++    assert src.count('asm volatile("mov.u32 %0, %%tid.x;"') == 1
++    assert src.count('asm volatile("mov.u32 %0, %%ctaid.x;"') == 1
++    assert f"__builtin_assume(__tirx_cached_tid_x < {threads});" in src
++    assert "__builtin_assume(__tirx_cached_ctaid_x < 3);" in src
++
++
+ def test_cluster_cta_id_codegen_uses_coordinate_sregs():
+     @T.prim_func
+     def main(A: T.Buffer((1,), "int32")):

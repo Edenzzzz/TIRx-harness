@@ -41,28 +41,43 @@ carries each row's fidelity note.
 Racecheck checks reads after writes (RAW), writes after reads (WAR), and
 writes after writes (WAW) to overlapping physical bytes, even when different
 parameters or multicast/unicast addresses name them. A conflict needs the
-required causal ordering or applicable strong-access atomicity. These are
-the obligations checked for the supported operations:
+required causal ordering or applicable strong-access atomicity. Each access
+must also satisfy alignment and bounds. The rule map pairs the checked
+obligations with passing forms, counterexamples, and their tests.
 
-| Operations | Semantics checked |
-|---|---|
-| `multimem.ld_reduce`, `st`, and `red` | The address must belong to a multicast window; each access must satisfy alignment and bounds. Ordinary `ld`/`st`/atomics on that window are invalid. A multimem access affects its replicas, but is not one atomic transaction across the entire replica set. |
-| Strong `multimem.st`/`red` and their unicast counterparts | Scope must include the other thread. Cross-rank communication requires `.sys`; `.gpu`, `.cluster`, and `.cta` cannot cover another GPU. Concurrent weak stores race. Strong operations do not automatically publish unrelated data. |
-| Release arrival followed by an acquire read/poll | The acquire must observe the release's write, directly or through a qualifying read-modify-write (RMW) chain. Each relevant link must have the required strength and scope. A flag preinitialized to the target value provides no such observation. |
-| `fence.acq_rel.sys` + relaxed arrival; relaxed strong poll + `fence.acq_rel.sys` | The release pattern publishes only accesses before its release fence; the acquire pattern orders only accesses after its acquire fence. A weak poll, a bare relaxed poll, and a reduction's internal read cannot substitute for the required acquire pattern. |
-| Returned `atom.relaxed` / `atom.release` followed by an acquire fence | The returned RMW read preserves the release publications it observed for a subsequent, sufficiently scoped acquire fence. A fence before the read does not acquire that observation. A `red` operation's internal read cannot feed this pattern. |
-| `fence.proxy.alias` | A generic access and a multicast-alias access to the same data need an alias fence on their causal path, in either direction. A fence before the producer's write or after the consumer's read is ineffective. Warp/CTA ordering alone does not bridge the alias. |
-| Multicast flag arrival and unicast strong polling | The checked NVLS idiom permits a `.sys` release reduction and strong acquire poll on the same flag without an alias fence on that flag. The payload data still needs its own applicable alias bridge. |
-| `bar.warp.sync` / CTA synchronization around a signal and wait | The signaling lane must first acquire the participating lanes' writes, and the consuming lanes must acquire the waiting lane's dependency. A lane-0 signal does not implicitly publish every lane or warp. |
-| Bulk/TMA stores followed by multimem reads | Shared staging writes need the generic-to-async visibility fence. Global destination writes must complete before publication; `wait_group.read` only completes the source reads. Multicast consumption also needs the alias bridge. A full `wait_group 0` supplies the store's completion dependency, so the tested completed-store path needs no extra async fence. |
-| Bulk/TMA loads consumed by MMA or ordinary shared reads | The consumer must wait for the load's `mbarrier::complete_tx` completion before accessing the destination. Merely issuing a copy or using the same barrier address supplies no wait dependency. |
+Same-element strong flag loads and stores/RMWs are not data races when their
+scopes cover one another, including polls that observe the initial flag value
+([PTX 8.7.1](https://docs.nvidia.com/cuda/parallel-thread-execution/#conflict-and-data-races)).
+This does not order unrelated payload bytes: an acquire still has to observe
+the corresponding release. `tests/analysis_tools/racecheck/test_strong_flag_reads.py`
+checks both the flag exemption and an unobserved-payload counterexample.
+
+### PTX rule map
+
+| PTX rule | Passing forms | Counterexamples | Related tests |
+|---|---|---|---|
+| 8.2.3 multimem addresses | `multimem.ld_reduce`, `st`, and `red` on multicast windows | Ordinary `ld`/`st`/atomics on a window; `multimem.st`/`red` on a unicast address. Both are memory errors in NumSim, Racecheck, and Synccheck. | [Racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_non_multimem_access_to_a_multimem_address_is_a_memory_error`; `test_multimem_access_to_a_unicast_address_is_a_memory_error` |
+| 8.5, 8.7 scope | `.sys` release and acquire, including `.sys` fences in fence-based patterns | A `.gpu` arrival or acquire; a `.gpu`/`.cta` release fence before a `.sys` reduction; a relaxed CAS followed by a `.gpu` acquire fence; `wait_until(scope="gpu")`. Every cross-rank payload pair races with `missing_inter_actor_sync`, plus `scope_mismatch`. | [Racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_scope_short_of_the_peer_rank_orders_no_cross_rank_pair` |
+| 8.7, 8.7.1 moral strength | Concurrent `.sys` `st`/`red`; mixed multicast and unicast `.sys` stores | Weak `multimem.st` from every rank produces WAW races; `.gpu` `st`/`red` produces cross-rank `scope_mismatch`; a weak poll races the arrivals it reads. | [Racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_morally_strong_concurrent_writes_do_not_race`; `test_weak_multimem_stores_from_every_rank_race`; `test_gpu_scoped_multimem_writes_are_not_morally_strong_across_ranks`; `test_weak_flag_poll_races_the_arrivals` |
+| 8.8 release/acquire patterns | `red.release.sys`; `fence.acq_rel.sys` + relaxed reduction; acquire CAS; relaxed CAS + `fence.acq_rel.sys`; `wait_until(scope="sys")` | A bare relaxed arrival or poll, weak poll, or no wait leaves cross-rank payload pairs unordered. A store after the release fence is unpublished; a read before the acquire fence is unacquired. | [Racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_sys_release_acquire_with_alias_fence_on_the_path_is_clean`; `test_no_release_acquire_pattern_orders_no_cross_rank_pair`; `test_store_after_the_release_fence_is_not_published`; `test_read_before_the_acquire_fence_is_not_acquired` |
+| 8.8 returned RMW reads | Returned `atom.relaxed` / `atom.release` observes the publication, then a sufficiently scoped acquire fence precedes the payload read | Put the acquire fence before the returned RMW, or replace it with a non-returning `red`: the payload remains unordered. | [Rust Racecheck](../../src/tirx_harness/numsim/engine-rs/src/native_analysis/racecheck/global_race.rs): `returned_release_rmw_can_feed_an_acquire_fence` |
+| 8.9.2 RMW chains | Every arrival uses `.sys`, preserving the observed releases through the flag's RMW chain | One rank's `.gpu` reduction cuts the chain for peers after it; that rank's payload reaches no peer. | [Racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_one_gpu_scoped_arrival_breaks_the_flag_rmw_chain` |
+| 8.9.4 synchronizes-with | The acquire poll reads the arrivals, directly or through a qualifying RMW chain | Initialize the polled flag to `world` and send arrivals to another word: the wait completes without observing a release, but payload reads have `missing_inter_actor_sync`. | [Racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_no_release_acquire_pattern_orders_no_cross_rank_pair` |
+| 8.6, 8.9.5 alias proxies | `fence.proxy.alias` after the payload stores or after the acquire wait, on the causal path between generic and multicast-alias accesses in either direction | Omit the alias fence, put it before the stores, or put it after the reads: every payload pair, even within one rank, has `missing_proxy_bridge`. A multicast store read through unicast also needs the bridge (RAW and WAR). | [Racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_alias_fence_off_the_causality_path_bridges_nothing`; `test_multicast_publication_read_through_unicast_needs_the_alias_fence` |
+| 8.9.5 lane participation and cumulativity | `bar.warp.sync` / CTA synchronization brings participating writes before the signaling lane's release and consuming reads after the waiting lane's acquire | Remove the warp barrier before lane 0's arrival or after its wait: lanes 1–31 have cross-rank `missing_inter_actor_sync`. | [Racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_lanes_off_the_releasing_lane_need_a_barrier` |
+| NVLS flag publication | A `.sys` release reduction and strong acquire poll on the same flag, without requiring an alias fence on that flag; the payload has its own applicable alias bridge | A correctly acquired flag does not bridge its payload: unicast payload writes followed by multicast reads without an alias fence still have `missing_proxy_bridge`. | [Racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_sys_release_acquire_with_alias_fence_on_the_path_is_clean`; `test_alias_fence_off_the_causality_path_bridges_nothing` |
+| 8.11.1 reductions form no acquire | A strong acquire poll, or a returned strong read followed by an acquire fence | A weak poll, then `red.relaxed.sys` to the flag, then `fence.acq_rel.sys`: the reduction's internal read supplies no acquire observation. | [Racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_no_release_acquire_pattern_orders_no_cross_rank_pair`; `test_weak_flag_poll_races_the_arrivals` |
+| Async-proxy store completion | Shared staging fence, full `wait_group 0`, system publication, and payload alias bridge; the tested completed-store path needs no extra async fence | No staging `fence.proxy.async` races the TMA store's shared reads with the epilogue's writes (`missing_proxy_bridge`). Publishing after only `wait_group.read` leaves global destination writes incomplete/unbridged (`missing_inter_actor_sync` or `missing_proxy_bridge`). | [Racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_kernels.py): `test_sys_scoped_alias_fenced_protocol_is_clean`; `test_unfenced_staging_races_the_tma_store`; `test_arrival_after_a_read_only_store_wait_publishes_no_tile` |
+| Async load completion | The shared-memory consumer waits for the load's `mbarrier::complete_tx` completion before reading operands | Skip the MMA load wait: the kernel test detects `uninitialized_read` and `mbarrier_*` violations as the pipeline falls out of step. Issuing a load or reusing its barrier address supplies no wait dependency. | [Racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_kernels.py): `test_mma_skipping_the_load_wait_reads_unloaded_operands`; [Synccheck](../../tests/analysis_tools/synccheck/test_native_multimem_kernels.py): `test_mma_skipping_the_load_wait_leaves_tma_completions_unconsumed` |
+| Liveness (Synccheck) | Every rank adds to every flag replica; expected arrivals match the participating ranks | A silent rank, the wrong flag slot, or `st` instead of incrementing `red` deadlocks every rank. Waiting for more arrivals than participating ranks also cannot complete. | [Synccheck ordering tests](../../tests/analysis_tools/synccheck/test_native_multimem_ordering_rules.py): `test_flag_that_never_reaches_world_deadlocks_every_rank`; `test_ordering_counterexamples_still_complete`; [kernel tests](../../tests/analysis_tools/synccheck/test_native_multimem_kernels.py): `test_spin_on_more_arrivals_than_ranks_never_completes` |
 
 For `ld_reduce`, the check concerns every accessed replica, not just the
 returned reduced value. Numerically equal results do not prove ordering.
 Alias-path counterexamples can fail even within one rank. Findings identify
 the source accesses and overlap; cross-rank scope failures carry
 `scope_mismatch`, and missing ingredients are reported as
-`missing_inter_actor_sync` or `missing_proxy_bridge`.
+`missing_inter_actor_sync` or `missing_proxy_bridge`. The ordering tests assert
+the conflicting rank/vector pairs, not just the verdict.
 
 ### Synchronization and liveness
 
@@ -75,6 +90,17 @@ incrementing reduction, or an expected count greater than the participating
 ranks can leave the launch deadlocked. Deadlock requires that no modeled
 participant or pending completion can make progress. Reaching an exploration
 or resource limit is `incomplete`, not proof of deadlock.
+
+For example, with four ranks and zero-initialized flags, every rank must add
+one to each flag replica before waiting for four. A silent rank leaves the
+count at three; arrivals to another word leave the polled word at zero; replacing
+the increments with `multimem.st.release.sys(..., 1)` leaves it at one. These
+cases produce a `deadlock` finding with every rank blocked. In contrast,
+removing the alias fence or using a relaxed poll still lets the flags reach
+four: Synccheck completes, while Racecheck reports the missing ordering.
+See `test_flag_that_never_reaches_world_deadlocks_every_rank` and
+`test_ordering_counterexamples_still_complete` in the
+[Synccheck ordering tests](../../tests/analysis_tools/synccheck/test_native_multimem_ordering_rules.py).
 
 ### Check contract and limits
 
@@ -103,7 +129,7 @@ simulation does not alone establish a happens-before edge. The consumer must
 observe the appropriate release, both endpoints must cover the communicating
 threads, and any required proxy bridge must lie on that causal path.
 
-The rules and counterexamples below describe the checked guarantees and limits.
+The rules and counterexamples above describe the checked guarantees and limits.
 The PTX references are [multimem addresses and instructions](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-multimem),
 [scopes](https://docs.nvidia.com/cuda/parallel-thread-execution/#scope),
 [proxies](https://docs.nvidia.com/cuda/parallel-thread-execution/#proxies),
@@ -157,21 +183,6 @@ Passing the latter's checks does not validate the former's memory ordering:
 
 `tests/numsim/support/runtime_cases.py` registers these tests as the runtime
 cases of the new ops, which `test_operation_runtime_cases.py` requires.
-
-### PTX rule map
-
-| Rule | Passing form | Counterexamples | Related tests |
-|---|---|---|---|
-| 8.2.3 multimem addresses | multimem ops on windows | `ld`/`st`/`red` on a window; `multimem.st`/`red` on a unicast address. Both are memory errors in NumSim, Racecheck, and Synccheck. | [racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_non_multimem_access_to_a_multimem_address_is_a_memory_error`; `test_multimem_access_to_a_unicast_address_is_a_memory_error` |
-| 8.5, 8.7 scope | `.sys` release and acquire | a `.gpu` red; `fence.acq_rel.gpu` or `.cta` before a `.sys` red (the release pattern's fence must be `.sys`); a `.gpu` acquire CAS; a relaxed CAS then `fence.acq_rel.gpu` (the acquire pattern's fence must be `.sys`); `wait_until(scope="gpu")`. Every cross-rank pair races, plus cross-rank `scope_mismatch`. | [racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_scope_short_of_the_peer_rank_orders_no_cross_rank_pair` |
-| 8.7, 8.7.1 moral strength | concurrent `.sys` `st`/`red`; mixed multicast and unicast `.sys` stores | weak `multimem.st` from every rank (write/write races); `.gpu` `st`/`red` (`scope_mismatch`); a weak poll races the arrivals it reads | [racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_morally_strong_concurrent_writes_do_not_race`; `test_gpu_scoped_multimem_writes_are_not_morally_strong_across_ranks` |
-| 8.8 release/acquire patterns | `fence.acq_rel.sys` + relaxed red; relaxed CAS + `fence.acq_rel.sys`; `wait_until(scope="sys")` | relaxed red, relaxed CAS, weak poll, or no wait (all cross-rank pairs race); a store after the release fence is unpublished; a read before the acquire fence is unacquired | [racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_no_release_acquire_pattern_orders_no_cross_rank_pair`; `test_store_after_the_release_fence_is_not_published`; `test_read_before_the_acquire_fence_is_not_acquired` |
-| 8.9.2 RMW chains | every arrival `.sys` | one rank's `.gpu` red cuts the chain for the peers after it | [racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_one_gpu_scoped_arrival_breaks_the_flag_rmw_chain` |
-| 8.9.4 synchronizes-with | wait reads the arrivals | a flag initialized to `world` is read without observing any release | [racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_no_release_acquire_pattern_orders_no_cross_rank_pair` |
-| 8.9.5 causality, cumulativity | `bar.warp.sync` around lane 0's arrival and wait; alias fence after the stores or after the wait | no barrier before (stores precede no release) or after (reads follow no acquire); alias fence absent, before the stores, or after the reads (every pair, even same rank, `missing_proxy_bridge`); `multimem.st` broadcast read through unicast (RAW and WAR) without the alias fence | [racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_alias_fence_off_the_causality_path_bridges_nothing`; `test_lanes_off_the_releasing_lane_need_a_barrier`; `test_multicast_publication_read_through_unicast_needs_the_alias_fence` |
-| 8.11.1 reductions form no acquire | strong acquire poll | weak poll, then `red.relaxed.sys` to the flag, then `fence.acq_rel.sys` | [racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_ordering_rules.py): `test_no_release_acquire_pattern_orders_no_cross_rank_pair`; `test_weak_flag_poll_races_the_arrivals` |
-| Async-proxy completion | staging fence, full `wait_group` | no staging `fence.proxy.async` (TMA store races the epilogue's SMEM writes); `wait_group.read` before the arrival (the store's global writes are neither complete nor bridged) | [racecheck](../../tests/analysis_tools/racecheck/test_native_multimem_kernels.py): `test_unfenced_staging_races_the_tma_store`; `test_arrival_after_a_read_only_store_wait_publishes_no_tile` |
-| Liveness (Synccheck) | every rank adds to every flag replica | a silent rank, the wrong slot, `st` instead of `red`, more expected arrivals than ranks: deadlock with every rank's warps blocked | [synccheck](../../tests/analysis_tools/synccheck/test_native_multimem_ordering_rules.py): `test_flag_that_never_reaches_world_deadlocks_every_rank` |
 
 ### Live GPU validation
 
