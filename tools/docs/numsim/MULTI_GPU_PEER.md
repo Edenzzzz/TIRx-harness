@@ -113,8 +113,9 @@ contains 5944 instructions versus the reference's 5024, counting predicated
 instructions (the earlier 31% count was incomplete). The rebuilt generic
 [loop and coordinate lowering](lowering/README.md) reduces the count to 4104
 and passes all 14 shapes in the first GPU matrix, with exact output/statistics
-equality and a worst ratio of 1.0092574x (`dsv3_t1`). The independent repeat and
-the other kernels' compiler-regression matrices remain in progress. These
+equality and a worst ratio of 1.0092574x (`dsv3_t1`). The independent repeat's
+one-token result is 1.0106940x, outside the 99% gate; parity remains incomplete.
+Further lowering investigation and the other kernels' matrices remain in progress. These
 results require the patched compiler and do not establish parity for the
 unpatched dependency.
 

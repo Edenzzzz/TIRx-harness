@@ -91,8 +91,10 @@ restoring the reference's mask-guarded combine-load synchronization, the
 loop-and-coordinate prototype passes two independent 11-round comparisons:
 98.138/97.452 microseconds (1.007039x) and 98.917/98.713 microseconds (1.002067x),
 both with bitwise-equal output and statistics. The rebuilt compiler's complete
-first 14-shape matrix passes, with a worst ratio of 1.0092574x (`dsv3_t1`). Its
-independent repeat and the other distributed kernels' matrices are in progress.
+first 14-shape matrix passes, with a worst ratio of 1.0092574x (`dsv3_t1`). The
+independent one-token repeat is 98.196/97.157 microseconds (1.0106940x), just
+outside the 99% gate, so full parity remains incomplete. Further lowering
+investigation and the other distributed kernels' matrices are in progress.
 Reduced static instruction count alone does not establish any unmeasured gate.
 
 ## Regression tests
