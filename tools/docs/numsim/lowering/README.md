@@ -199,6 +199,13 @@ the earlier 1.0134496x miss or prove that allocation cost alone explains it.
 The stack-packing build's complete 14-shape matrix and independent repeat
 are running in separate result files.
 
+The stack build's first tiny `port_t2_h1024_e8_k1` result is
+35.943/35.436 microseconds (1.0143075x), with exact output/statistics. It still
+misses the gate; passing one-token diagnostics do not close full parity.
+The other three distributed kernels' independent compiler-regression rounds
+are complete and pass on every retained configuration, as recorded in the
+[validation audit](../MULTI_GPU_VALIDATION.md#current-evidence).
+
 ### Timeline evidence
 
 Four-rank IKET captures retain the original work assignment. The cold capture
@@ -208,9 +215,10 @@ the uninstrumented Kineto benchmark remains the performance gate. The warm
 capture separately verifies output/statistics against DeepGEMM. Trace files
 remain outside Git under the caller's artifact directory.
 
-1. **Critical path:** the slowest rank's MMA role ends at 83.936 microseconds;
-   phase-two NVLink synchronization ends at 89.536 and the final epilogue at
-   96.928. L1-full waits reach 23.328 microseconds. These are exposed dependency
+1. **Critical path:** on the rank with the longest MMA-role span, that role
+   ends at 83.936 microseconds, phase-two NVLink synchronization at 89.088,
+   and the epilogue at 95.584, all relative to that rank's first warp start.
+   L1-full waits reach 23.328 microseconds. These are exposed dependency
    waits, not evidence that fewer static instructions alone close the gate.
 2. **Overlap and bubbles:** loader, MMA, and epilogue roles begin within
    1.344–1.632 microseconds, so the roles overlap rather than execute serially.

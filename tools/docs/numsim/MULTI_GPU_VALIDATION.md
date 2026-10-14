@@ -119,6 +119,23 @@ open. A separate **13-test** launcher/fidelity run verifies bounded retries
 for rendezvous port collisions, queue/environment cleanup, and immediate
 propagation of non-startup errors. Bootstrap retries change no kernel or timer.
 
+The rebuilt-compiler regression matrices for the other three kernels are now
+complete. An audit checks the exact retained configuration sets, not only the
+presence of a shape name. Every row is numerically correct and meets 99%:
+
+| Kernel | Rows per round | Worst ratio, first / repeat | Baseline-selected worst, first / repeat |
+|---|---:|---:|---:|
+| Two-shot all-reduce | 18 | 1.0026662 / 1.0021546 | Same configurations |
+| All-gather GEMM | 17 × 8 = 136 | 1.0034713 / 1.0042671 | 1.0024041 / 1.0034185 |
+| GEMM + all-reduce | 19 × 2 × 3 = 114 | 1.0065379 / 1.0062278 | 1.0018165 / 1.0023831 |
+
+These kernels have no scalar-parameter table candidates or `tirx.ptx.mov`
+calls in the 802-function scope audit. The later grouped-argument stack path
+does not execute for them. Mega MoE remains the unresolved performance gate:
+its stack-packing first tiny-shape comparison is 35.943/35.436 microseconds
+(1.0143075x), despite exact output/statistics. That miss is preserved rather
+than replaced by the passing one-token diagnostic comparisons.
+
 ## Historical evidence
 
 After the ABI update, **138 additional targeted tests pass** for the complete
