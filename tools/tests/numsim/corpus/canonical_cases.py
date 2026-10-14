@@ -302,6 +302,7 @@ CANONICAL_KERNEL_CASES = (
     CanonicalKernelCase(
         "sm100_fp8_fp4_mega_moe",
         prepare_mega_moe_case,
+        racecheck_expected_verdict="clean",
     ),
     CanonicalKernelCase(
         "deepgemm_sm100_fp4_mqa_logits",
