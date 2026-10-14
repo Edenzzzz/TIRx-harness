@@ -19,7 +19,10 @@ csrc/jit_kernels/heuristics/mega_moe.h.
 """
 
 import math
+import tvm.tirx as tirx
+import tvm_ffi
 import tirx_kernels.tirx_lite as txl
+from tirx_kernels.tirx_lite.low_level_ir import check_low_level_ir
 from tvm.ir.type import PointerType, PrimType
 
 from .spec import (
@@ -694,14 +697,8 @@ def get_kernel(
 
     def symm_rank_offset_arg_expr(symm_rank_offsets, mapped_rank_idx):
         if num_processes == 1:
-            return symm_rank_offsets[0]
-        mapped_rank_idx_u32 = txl.cast(mapped_rank_idx, "uint32")
-        rank_offset = symm_rank_offsets[0]
-        for rank in range(1, num_processes):
-            rank_offset = txl.Select(
-                mapped_rank_idx_u32 == txl.uint32(rank), symm_rank_offsets[rank], rank_offset
-            )
-        return rank_offset
+            return txl.int64(0)
+        return symm_rank_offsets[txl.cast(mapped_rank_idx, "int32")]
 
     def load_symm_rank_base(dst, sym_buffer_base, symm_rank_offsets, mapped_rank_idx):
         return txl.assign(
@@ -856,83 +853,13 @@ def get_kernel(
         arch="sm_100a",
         min_blocks_per_sm=1,
         grid=kernel_config.num_sms,
+        check_ir=False,
     )
     def mega_moe(
         y: txl.gptr[txl.bf16],
         cumulative_local_expert_recv_stats: txl.gptr[txl.i32],
         symm_buffer: txl.gptr[txl.i8],
-        symm_rank_offset_0: txl.i64,
-        symm_rank_offset_1: txl.i64,
-        symm_rank_offset_2: txl.i64,
-        symm_rank_offset_3: txl.i64,
-        symm_rank_offset_4: txl.i64,
-        symm_rank_offset_5: txl.i64,
-        symm_rank_offset_6: txl.i64,
-        symm_rank_offset_7: txl.i64,
-        symm_rank_offset_8: txl.i64,
-        symm_rank_offset_9: txl.i64,
-        symm_rank_offset_10: txl.i64,
-        symm_rank_offset_11: txl.i64,
-        symm_rank_offset_12: txl.i64,
-        symm_rank_offset_13: txl.i64,
-        symm_rank_offset_14: txl.i64,
-        symm_rank_offset_15: txl.i64,
-        symm_rank_offset_16: txl.i64,
-        symm_rank_offset_17: txl.i64,
-        symm_rank_offset_18: txl.i64,
-        symm_rank_offset_19: txl.i64,
-        symm_rank_offset_20: txl.i64,
-        symm_rank_offset_21: txl.i64,
-        symm_rank_offset_22: txl.i64,
-        symm_rank_offset_23: txl.i64,
-        symm_rank_offset_24: txl.i64,
-        symm_rank_offset_25: txl.i64,
-        symm_rank_offset_26: txl.i64,
-        symm_rank_offset_27: txl.i64,
-        symm_rank_offset_28: txl.i64,
-        symm_rank_offset_29: txl.i64,
-        symm_rank_offset_30: txl.i64,
-        symm_rank_offset_31: txl.i64,
-        symm_rank_offset_32: txl.i64,
-        symm_rank_offset_33: txl.i64,
-        symm_rank_offset_34: txl.i64,
-        symm_rank_offset_35: txl.i64,
-        symm_rank_offset_36: txl.i64,
-        symm_rank_offset_37: txl.i64,
-        symm_rank_offset_38: txl.i64,
-        symm_rank_offset_39: txl.i64,
-        symm_rank_offset_40: txl.i64,
-        symm_rank_offset_41: txl.i64,
-        symm_rank_offset_42: txl.i64,
-        symm_rank_offset_43: txl.i64,
-        symm_rank_offset_44: txl.i64,
-        symm_rank_offset_45: txl.i64,
-        symm_rank_offset_46: txl.i64,
-        symm_rank_offset_47: txl.i64,
-        symm_rank_offset_48: txl.i64,
-        symm_rank_offset_49: txl.i64,
-        symm_rank_offset_50: txl.i64,
-        symm_rank_offset_51: txl.i64,
-        symm_rank_offset_52: txl.i64,
-        symm_rank_offset_53: txl.i64,
-        symm_rank_offset_54: txl.i64,
-        symm_rank_offset_55: txl.i64,
-        symm_rank_offset_56: txl.i64,
-        symm_rank_offset_57: txl.i64,
-        symm_rank_offset_58: txl.i64,
-        symm_rank_offset_59: txl.i64,
-        symm_rank_offset_60: txl.i64,
-        symm_rank_offset_61: txl.i64,
-        symm_rank_offset_62: txl.i64,
-        symm_rank_offset_63: txl.i64,
-        symm_rank_offset_64: txl.i64,
-        symm_rank_offset_65: txl.i64,
-        symm_rank_offset_66: txl.i64,
-        symm_rank_offset_67: txl.i64,
-        symm_rank_offset_68: txl.i64,
-        symm_rank_offset_69: txl.i64,
-        symm_rank_offset_70: txl.i64,
-        symm_rank_offset_71: txl.i64,
+        symm_rank_offsets: txl.gptr[txl.i64, (72,)],
         tensor_map_l1_acts: txl.TensorMap,
         tensor_map_l1_acts_sf: txl.TensorMap,
         tensor_map_l1_weights: txl.TensorMap,
@@ -958,81 +885,6 @@ def get_kernel(
         num_tokens: txl.i32,
         rank_idx: txl.i32,
     ):
-        symm_rank_offsets = (
-            symm_rank_offset_0,
-            symm_rank_offset_1,
-            symm_rank_offset_2,
-            symm_rank_offset_3,
-            symm_rank_offset_4,
-            symm_rank_offset_5,
-            symm_rank_offset_6,
-            symm_rank_offset_7,
-            symm_rank_offset_8,
-            symm_rank_offset_9,
-            symm_rank_offset_10,
-            symm_rank_offset_11,
-            symm_rank_offset_12,
-            symm_rank_offset_13,
-            symm_rank_offset_14,
-            symm_rank_offset_15,
-            symm_rank_offset_16,
-            symm_rank_offset_17,
-            symm_rank_offset_18,
-            symm_rank_offset_19,
-            symm_rank_offset_20,
-            symm_rank_offset_21,
-            symm_rank_offset_22,
-            symm_rank_offset_23,
-            symm_rank_offset_24,
-            symm_rank_offset_25,
-            symm_rank_offset_26,
-            symm_rank_offset_27,
-            symm_rank_offset_28,
-            symm_rank_offset_29,
-            symm_rank_offset_30,
-            symm_rank_offset_31,
-            symm_rank_offset_32,
-            symm_rank_offset_33,
-            symm_rank_offset_34,
-            symm_rank_offset_35,
-            symm_rank_offset_36,
-            symm_rank_offset_37,
-            symm_rank_offset_38,
-            symm_rank_offset_39,
-            symm_rank_offset_40,
-            symm_rank_offset_41,
-            symm_rank_offset_42,
-            symm_rank_offset_43,
-            symm_rank_offset_44,
-            symm_rank_offset_45,
-            symm_rank_offset_46,
-            symm_rank_offset_47,
-            symm_rank_offset_48,
-            symm_rank_offset_49,
-            symm_rank_offset_50,
-            symm_rank_offset_51,
-            symm_rank_offset_52,
-            symm_rank_offset_53,
-            symm_rank_offset_54,
-            symm_rank_offset_55,
-            symm_rank_offset_56,
-            symm_rank_offset_57,
-            symm_rank_offset_58,
-            symm_rank_offset_59,
-            symm_rank_offset_60,
-            symm_rank_offset_61,
-            symm_rank_offset_62,
-            symm_rank_offset_63,
-            symm_rank_offset_64,
-            symm_rank_offset_65,
-            symm_rank_offset_66,
-            symm_rank_offset_67,
-            symm_rank_offset_68,
-            symm_rank_offset_69,
-            symm_rank_offset_70,
-            symm_rank_offset_71,
-        )
-
         def prefetch_all_tensormaps(prefetch_warp_idx):
             with txl.If(prefetch_warp_idx == 0), txl.Then():
                 prefetch_tensormap(tensor_map_l1_acts)
@@ -4282,4 +4134,14 @@ def get_kernel(
         with epilogue_role:
             epilogue(txl.warp_id_in_role(), txl.tid_in_role())
 
-    return mega_moe.func.with_attr("tirx.kernel_launch_params", get_tirx_launch_param_tags())
+    function = mega_moe.func.with_attr("tirx.kernel_launch_params", get_tirx_launch_param_tags())
+    parameter = next(value for value in function.params if value.name == "symm_rank_offsets")
+    by_value = tirx.decl_buffer(
+        parameter.shape, str(parameter.dtype), name=parameter.name, scope="local.param",
+        data_alignment=parameter.data_alignment, layout=parameter.layout,
+    )
+    function = tvm_ffi.structural_map(
+        function, (tirx.Var, lambda value: by_value if value.same_as(parameter) else value)
+    )
+    check_low_level_ir(function)
+    return function

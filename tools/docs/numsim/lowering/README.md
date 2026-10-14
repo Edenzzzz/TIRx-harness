@@ -62,56 +62,69 @@ Predicated copies, predicate-register moves, mixed-type bit reinterpretations,
 and memory destinations retain their instruction forms. The PTX table and its
 one-instruction renderer are unchanged.
 
-### Parameter-table lowering
+The same simplifier exposes a plain unpredicated `add.u32` on local registers
+as unsigned addition. It preserves 32-bit wraparound and leaves predicated,
+saturating, mixed-type, and other-width forms untouched. This lets the reference's
+ordinary address-plus-16 expression reach normal address lowering instead of
+remaining opaque inline assembly; it does not change the instruction contract.
+
+### By-value parameter buffers
 
 The reference's `layout/sym_buffer.cuh::SymBuffer::map` reads a rank offset
 from its by-value kernel-parameter array. The port previously staged the
 offsets into an extra shared-memory cache. That staging is not present in
-DeepGEMM and is now removed: the port selects its existing scalar offset
-parameters directly, without changing the work assignment or synchronization.
+DeepGEMM and is removed. The port now declares one 72-element rank-offset
+array, matching the reference rather than exposing 72 scalar parameters or
+requiring a scalar-selection pattern to be recognized.
 
-`ScalarParameterGroups` in `src/target/build_common.h` recognizes four-value
-selection tables over contiguous homogeneous scalar parameters. CUDA codegen
-packs those parameters into a `const __grid_constant__` array struct and emits
-an indexed parameter read. It preserves the original selection's fallback to
-element zero for negative or out-of-range indices. Other table shapes retain
-their existing lowering. Selectors must be safe to repeat; a global load
-materialized into a local value is read only once.
+`ByValueParameterBuffers` in `src/target/build_common.h` recognizes fixed,
+flat, read-only `local.param` buffers. CUDA codegen emits a naturally aligned
+`const __grid_constant__` array struct; normal indexed reads lower to the
+reference's constant-parameter loads. The host binder requires a CPU tensor
+with the declared dtype, shape, and contiguous layout. Stores and escaped
+parameter addresses are rejected. Supported elements are scalar signed and
+unsigned 32-/64-bit integers and 32-/64-bit floats, with 1–1024 elements.
 
-`src/runtime/pack_args.h::PackFuncVoidAddr` repacks the four converted scalar
-values for the internal device ABI. Metadata tags preserve that packing across
-library export/reload. The public scalar-call signature, 72 rank-offset
-arguments, and NumSim multi-rank bindings do not change. Compiler and runtime
-must both come from the patched build; this introduces no newer instruction
-or toolkit requirement than the existing CUDA 13.2 comparison.
+`src/runtime/pack_args.h::PackFuncVoidAddr` passes the CPU data address to the
+driver's by-value argument copy, including after library export/reload. Calls
+with at most 32 arguments use bounded stack scratch; larger calls retain
+dynamic scratch. The superseded four-scalar grouping experiment is removed;
+its serialized tags are rejected with an instruction to rebuild, not silently
+interpreted as another ABI.
+Exported modules carry `tirx.by_value_parameters_v1` in their launch metadata.
+Older runtimes reject that requirement before launching rather than mistaking
+the new argument tag for an ordinary pointer.
 
-The grouped launch path originally allocated four temporary vectors per call:
-converted addresses, narrow-value holders, grouped storage, and regrouped
-addresses. It now uses bounded stack storage for at most 32 original arguments
-and eight groups; larger calls retain dynamic storage. The argument values,
-metadata, public ABI, and CUDA instructions are unchanged. The two frozen
-compiler binaries are byte-identical, and comparisons load the same prepared
-statistics/no-statistics kernel libraries. Only the CUDA runtime's argument
-marshalling changes.
+The high-level Python kernel call remains unchanged. Direct PrimFunc calls and
+NumSim bindings now provide `symm_rank_offsets` as one array. NumSim ABI 42
+retains the by-value binding names in its host manifest and cache identity,
+then snapshots those arrays independently of aliased caller buffers for every
+rank. Numerical execution, Racecheck, and Synccheck use the same snapshots.
+The final low-level IR contract runs after declaring the parameter scope;
+ordinary global/shared loads remain forbidden by that contract.
+
+Compiler and runtime must both come from the patched build. This introduces
+no newer CUDA instruction or toolkit requirement than the CUDA 13.2 reference.
 
 ## Evidence
 
 The four-rank `dsv3_t1` case uses one token per rank, hidden size 7168,
 intermediate size 2048, 256 routed experts, top-8, and one shared expert.
-All captures use the same port sources, CUDA/NVRTC 13.2.78, and matched
-reference launch configuration. Counts include predicated instructions.
+Captures use CUDA/NVRTC 13.2.78 and matched reference launch configurations.
+Corrections restoring reference parameter storage and synchronization are
+identified below. Counts include predicated instructions.
 
 | Capture | SASS instructions | BF16 accumulations | Registers | Static shared bytes |
 |---|---:|---:|---:|---:|
 | DeepGEMM reference | 5024 | 112 | 128 | 1024 |
-| Current TIRx lowering | 5944 | 224 | 128 | 1024 |
+| Unpatched TIRx lowering | 5944 | 224 | 128 | 1024 |
 | Generic serial-loop lowering prototype | 4264 | 112 | 128 | 1024 |
 | Loop and coordinate lowering | 4104 | 112 | 128 | 1024 |
 | Loop, coordinate, and scalar-copy lowering | 4096 | 112 | 128 | 1024 |
 | With parameter-table lowering and reference parameter reads | 4080 | 112 | 128 | 1024 |
 
-The current port contains one combine body in generated CUDA; its two copies
-appear during CUDA compilation. Suppressing unrolling only on serial loops
+The port under the unpatched lowering contains one combine body in generated
+CUDA; its two copies appear during CUDA compilation. Suppressing unrolling only on serial loops
 containing `while` reduces the count to 5400. Suppressing it only on dynamic
 serial loops reduces the count to 4808. Applying both gives 4264.
 
@@ -126,7 +139,7 @@ variant with DeepGEMM, alternating kernel order inside each invocation:
 
 | Lowering | TIRx microseconds | Reference microseconds | TIRx/reference | Output/statistics |
 |---|---:|---:|---:|---|
-| Current | 100.457 | 97.072 | 1.034871 | Bitwise equal |
+| Unpatched | 100.457 | 97.072 | 1.034871 | Bitwise equal |
 | Prototype | 99.711 | 97.141 | 1.026456 | Bitwise equal |
 
 The loop-only prototype improves latency but still fails the 99% gate. After
@@ -136,16 +149,16 @@ loop-and-coordinate prototype passes two independent 11-round comparisons:
 both with bitwise-equal output and statistics. The rebuilt compiler's complete
 first 14-shape matrix passes, with a worst ratio of 1.0092574x (`dsv3_t1`). The
 independent one-token repeat is 98.196/97.157 microseconds (1.0106940x), just
-outside the 99% gate, so full parity remains incomplete. Further lowering
-investigation and the other distributed kernels' matrices are in progress.
+outside the 99% gate, so that build did not establish full parity. Further
+lowering investigation was required; the other kernels' matrices now pass.
 Reduced static instruction count alone does not establish any unmeasured gate.
 
 Adding transparent scalar copies passes two prototype comparisons at 1.0059873x
 and 1.0042761x, both numerically exact. The corresponding rebuilt IR simplifier
 produces 4096 instructions as well; eight independent constant-register moves
 have a different assembly order, so those timings are not substituted for the
-rebuilt compiler's own matrix. That matrix is running from an immutable compiler
-snapshot and a separate prepared-kernel cache.
+rebuilt compiler's own matrix, which uses an immutable compiler snapshot and
+a separate prepared-kernel cache.
 
 The new matrix's first tiny `port_t2_h1024_e8_k1` comparison is 1.041x, despite
 bitwise-equal outputs and statistics; its independent repeat is 0.972x. A
@@ -160,29 +173,27 @@ collective. Taking the median of each round's slowest rank gives:
 | `dsv3_t1` | 99.60723 | 99.93063 | 99.29060 | 1.003189 / 1.006446 |
 
 Both versions meet the gate in this diagnostic. This does not erase the earlier
-failed comparisons or replace the independent full-matrix gate; the scalar-copy
-patch remains provisional while that validation finishes.
+failed comparisons or replace the independent full-matrix gate.
 
 An audit of the other benchmark kernels covers 456 GEMM/all-reduce rank/config
 functions, 274 all-gather functions (including auxiliary kernels), and 72
 two-shot rank functions. None contains `tirx.ptx.mov`; the copy simplification
-does not match them. Their loop/coordinate compiler-regression matrices continue
+does not match them. Their loop/coordinate compiler-regression matrices pass
 against the frozen preceding build.
 
 The same 802-function audit finds no four-parameter table candidates in those
 three other benchmarks. The new parameter-based Mega MoE port passes the
 four-rank numerical/race/sync examples and its first `dsv3_t1` GPU comparison:
 98.726/98.530 microseconds (1.001989x), with bitwise-equal output/statistics.
-All 14 shapes are prepared under a separate immutable compiler snapshot; the
-complete matrix and independent repeat are running. This first result is not
-a full-parity claim.
+All 14 shapes were prepared under a separate immutable compiler snapshot.
+This first result was not a full-parity claim.
 
-The final-source first matrix now passes all 14 shapes, with a worst ratio of
+The scalar-group variant's first matrix passes all 14 shapes, with a worst ratio of
 1.0044118x (`dsv3_t1`) and bitwise-equal output/statistics. The independent
 one-token repeat is 98.183/96.880 microseconds (1.0134496x), outside the
 unchanged 99% gate. That is a performance miss, not the separate rendezvous
 port collision; its row is retained and needs further lowering analysis.
-The other repeat and compiler-regression cases continue under the GPU lease.
+The miss remains part of the historical record below.
 
 An old/stack/stack/old comparison uses one four-GPU lease, the unchanged
 11-round benchmark, and separate worker invocations:
@@ -196,8 +207,7 @@ An old/stack/stack/old comparison uses one four-GPU lease, the unchanged
 
 All four comparisons are numerically exact. These observations do not erase
 the earlier 1.0134496x miss or prove that allocation cost alone explains it.
-The stack-packing build's complete 14-shape matrix and independent repeat
-are running in separate result files.
+The stack-packing build's matrix uses separate result files.
 
 The stack build's first tiny `port_t2_h1024_e8_k1` result is
 35.943/35.436 microseconds (1.0143075x), with exact output/statistics. It still
@@ -205,6 +215,40 @@ misses the gate; passing one-token diagnostics do not close full parity.
 The other three distributed kernels' independent compiler-regression rounds
 are complete and pass on every retained configuration, as recorded in the
 [validation audit](../MULTI_GPU_VALIDATION.md#current-evidence).
+
+The replacement by-value-array implementation removes the scalar-group
+experiment entirely. Its first prototype one-token comparison is
+100.861/99.806 microseconds (1.0105705x), a retained miss; its independent
+repeat is 100.598/100.182 (1.0041524x). Those prototype results are not
+substituted for the final source's matrix.
+
+The final source (`06dfdd4b74d34861`) also exposes plain unsigned register
+addition to normal lowering. Its one-token cubin contains 4064 instructions
+without statistics and 4080 with statistics, using 128 registers, 32 stack
+bytes, and 1024 static shared bytes. Both complete 14-shape matrices pass
+with bitwise-equal output/statistics. The worst ratios are 1.0085679x
+(`dsv3_t1`, first) and 1.0034897x (`dsv3_t8192`, repeat), below the unchanged
+`1 / 0.99` limit. Every declared shape retains its independent measurements:
+
+| Shape | First TIRx / reference microseconds | First ratio | Repeat TIRx / reference microseconds | Repeat ratio |
+|---|---:|---:|---:|---:|
+| `deepgemm_default` | 2702.000 / 2713.000 | 0.9959454 | 2705.000 / 2715.000 | 0.9963168 |
+| `dsv3_t1` | 99.351 / 98.507 | 1.0085679 | 99.052 / 99.301 | 0.9974925 |
+| `dsv3_t1024` | 441.220 / 440.034 | 1.0026952 | 440.787 / 440.367 | 1.0009537 |
+| `dsv3_t16` | 258.430 / 258.578 | 0.9994276 | 258.088 / 258.654 | 0.9978117 |
+| `dsv3_t2048` | 721.167 / 723.630 | 0.9965963 | 721.116 / 723.144 | 0.9971956 |
+| `dsv3_t256` | 308.764 / 309.197 | 0.9985996 | 307.996 / 308.423 | 0.9986155 |
+| `dsv3_t4096` | 1434.000 / 1431.000 | 1.0020964 | 1436.000 / 1434.000 | 1.0013947 |
+| `dsv3_t64` | 293.210 / 293.265 | 0.9998125 | 292.742 / 292.627 | 1.0003930 |
+| `dsv3_t8192` | 2587.000 / 2578.000 | 1.0034911 | 2588.000 / 2579.000 | 1.0034897 |
+| `port_t1024_e384_k6` | 642.645 / 643.884 | 0.9980757 | 643.691 / 644.214 | 0.9991882 |
+| `port_t256_e384_k6` | 575.398 / 575.314 | 1.0001460 | 575.683 / 576.125 | 0.9992328 |
+| `port_t2_h1024_e8_k1` | 36.158 / 38.252 | 0.9452578 | 36.249 / 37.062 | 0.9780638 |
+| `port_t64_e384_k6` | 556.477 / 556.605 | 0.9997700 | 554.103 / 553.822 | 1.0005074 |
+| `port_t8192_e384_k6` | 2395.000 / 2396.000 | 0.9995826 | 2392.000 / 2396.000 | 0.9983306 |
+
+These full final-source rounds establish the Mega MoE performance gate, not
+the preceding failed prototypes or reduced static instruction count alone.
 
 ### Timeline evidence
 
@@ -239,24 +283,32 @@ tests cover 17-, 32-, and 64-thread launches and cluster-coordinate mapping.
 
 On the unpatched installed compiler, the two default-policy regressions fail
 and the four explicit-policy/static-loop controls pass. On the rebuilt patched
-compiler, the complete non-GPU `test_codegen_cuda.py` suite reports 79 passed
+compiler, the complete non-GPU `test_codegen_cuda.py` suite reports 89 passed
 and one skipped. Both PTX dispatch/helper-golden regressions pass. Two GPU
 round trips preserve all bits of 32-/64-bit NaNs, signed zeros, infinities, and
 subnormals; five same-kernel partial-CTA GPU cases and all 59 simplifier tests
 also pass. Invalid width/type modifiers remain visible for normal rejection.
-This includes direct-codegen controls for contiguous, noncontiguous, and
-reordered device parameters.
-Eleven GPU tests pass: the two special-bit copy cases, four
-parameter-table scalar types, mixed-type multiple parameter groups, and four
-group-count cases covering both stack and dynamic packing. The
-table cases exercise both direct launches and exported/reloaded libraries,
-signed out-of-range indices, unrelated scalar arguments, and direct uses of a
-grouped parameter outside its selection table.
-Group counts 1, 7, 8, and 9 exercise the 32-argument boundary and dynamic
-fallback through both direct calls and exported/reloaded libraries.
-With this compiler selected, the harness's complete multimem/peer numerical,
-ordering-rule, and NumSim registry/ABI run passes 943 tests; all 94 live
-multimem GPU microtests also pass with no skips under a four-GPU socket lease.
+Fifteen focused GPU tests pass: two special-bit copy cases, unsigned-add
+wraparound, and six by-value-array types at extents 4 and 72. The array cases
+exercise direct calls and exported/reloaded libraries, preserve floating
+special-value bits, and assert the serialized runtime requirement. A separate
+cross-runtime probe confirms the current runtime executes that module and an
+older runtime rejects it before launch. Read-only and address-escape negative
+controls pass in codegen and NumSim.
+
+Three layout counterexamples reject strided, multidimensional, and nonzero-offset
+parameter declarations before flattening can hide their original geometry.
+They fail on the preceding compiler and pass after the validation fix.
+
+With ABI 42, 106 combined peer numerical/race/sync, parameter, ABI, and fidelity
+checks pass, including all four complete Mega MoE cases. The final snapshot/cache
+run passes 44 tests, and 67 wait/flag/diagnostic/canonical checks pass after
+updating stale strong-flag and pool-alias expectations. Both debug and release
+Rust suites pass 890 unit,
+four checker-import, and three public-surface tests. The earlier ABI 41 run
+passes 943 multimem/peer numerical, ordering-rule, and registry/ABI tests;
+all 94 live multimem GPU microtests pass with no skips under a four-GPU socket
+lease. Those earlier broad runs remain distinct from the final ABI 42 rerun.
 The focused command is:
 
 ```bash

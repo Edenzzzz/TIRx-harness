@@ -36,6 +36,13 @@ carries each row's fidelity note.
 
 ## Semantics checked
 
+The common launch model also supports read-only by-value parameter arrays.
+Each rank receives its own launch-time snapshot, including when the caller's
+NumPy views alias another binding. Bounds, immutability, address escape, and
+cache-reload policy are checked by
+`tests/numsim/integration/test_parameter_buffers.py`; the same rule applies in
+NumSim and both native checkers.
+
 ### Memory ordering rules
 
 Racecheck checks reads after writes (RAW), writes after reads (WAR), and
@@ -51,6 +58,12 @@ scopes cover one another, including polls that observe the initial flag value
 This does not order unrelated payload bytes: an acquire still has to observe
 the corresponding release. `tests/analysis_tools/racecheck/test_strong_flag_reads.py`
 checks both the flag exemption and an unobserved-payload counterexample.
+
+The raw/declared-word equivalence cases in
+`tests/numsim/runtime/test_wait_until.py` also keep strong polls clean, while
+weak-publication diagnostics and separate-payload counterexamples still fail.
+A single strong word read supplies no proof that the intended generation was
+observed; this is distinct from whether its access constitutes a data race.
 
 ### PTX rule map
 
@@ -470,10 +483,11 @@ Synccheck has no multimem-specific code:
 
 ### ABI
 
-`NUMSIM_ABI_VERSION` is 41, in both `numsim/abi.py` and `engine-rs/src/lib.rs`
+`NUMSIM_ABI_VERSION` is 42, in both `numsim/abi.py` and `engine-rs/src/lib.rs`
 (39 added multimem; 40 added the peer-memory `rank_mappings`, see
 [MULTI_GPU_PEER.md](MULTI_GPU_PEER.md); 41 retains exact CTA thread counts,
-including partial warps). Stale artifacts are rejected.
+including partial warps; 42 adds persistent launch-time parameter snapshots).
+Stale artifacts are rejected.
 
 ## POC kernels
 

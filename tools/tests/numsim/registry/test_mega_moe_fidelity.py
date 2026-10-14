@@ -72,12 +72,15 @@ def test_peer_offsets_are_selected_from_parameters_without_a_shared_cache(emitte
     assert "smem_symm_rank_bases" not in ast.unparse(tree)
     parameters = {argument.arg for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
                   for argument in node.args.args}
-    assert {f"symm_rank_offset_{rank}" for rank in range(72)} <= parameters
-    if "symm_rank_offset_3" in {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}:
-        tables = [call for call in calls(tree, "T.Select")
-                  if any(isinstance(argument, ast.Name) and argument.id == "symm_rank_offset_3"
-                         for argument in call.args)]
-        assert len(tables) >= 8
+    assert "symm_rank_offsets" in parameters
+    assert not any(name.startswith("symm_rank_offset_") for name in parameters)
+    definitions = [argument for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                   for argument in node.args.args if argument.arg == "symm_rank_offsets"]
+    assert len(definitions) == 1
+    annotation = definitions[0].annotation
+    assert ast.unparse(annotation.args[0]) == "(72,)"
+    assert any(keyword.arg == "scope" and keyword.value.value == "local.param"
+               for keyword in annotation.keywords)
 
 
 def test_unknown_ordering_is_rejected():

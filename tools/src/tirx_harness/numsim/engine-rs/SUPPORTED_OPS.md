@@ -1,7 +1,7 @@
 # NumSim Engine Operation Support
 
 This file is generated from NumSim's operation registry and is checked by tests.
-It describes NumSim ABI **v41**.
+It describes NumSim ABI **v42**.
 A listed operation may still reject modifier, dtype, shape, or layout values outside its exact specialization domain. Handwritten runtime cases cover registered operations; GPU parity is tested where the required hardware is available.
 Partial-warp CTA launches preserve the exact thread count and mask absent lanes. Scalar/control flow, memory operations, and atomics are supported; warp/CTA/cluster collectives and setmaxnreg in such launches currently fail closed as unsupported.
 

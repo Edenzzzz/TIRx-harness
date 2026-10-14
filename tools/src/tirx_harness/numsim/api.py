@@ -37,6 +37,7 @@ from .transpiler.frontend import (
     ModuleSpec,
     attach_source_nodes,
 )
+from .transpiler.parameter_buffers import snapshot_parameter_inputs
 from .transpiler.semantic_ir import cache_semantic_ir_serializations
 
 _DEFAULT_NATIVE_LOOP_ITERATION_BUDGET = 1_000_000
@@ -761,6 +762,7 @@ class Engine:
             )
         contract = _host_abi(module)
         canonical_inputs, aliases, ambiguous_aliases = _canonicalize_buffer_names(contract, inputs)
+        canonical_inputs = snapshot_parameter_inputs(module.spec, contract, canonical_inputs)
         output_names, external_names = _resolve_output_names(
             contract, canonical_inputs, aliases, ambiguous_aliases, outputs
         )
@@ -799,6 +801,7 @@ class Engine:
             canonical, aliases, ambiguous_aliases = _canonicalize_buffer_names(
                 contract, rank_inputs
             )
+            canonical = snapshot_parameter_inputs(module.spec, contract, canonical)
             canonical_ranks.append(canonical)
         output_names, external_names = _resolve_output_names(
             contract, canonical_ranks[0], aliases, ambiguous_aliases, outputs

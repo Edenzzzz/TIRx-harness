@@ -3,7 +3,7 @@
 Every rank owns ``experts_per_rank`` routed experts and one shared expert, and
 routes its tokens to experts on any rank. ``symm_buffer`` is a
 :class:`~tirx_harness.numsim.SymmetricBuffer`, and the kernel reaches the other
-ranks' replicas through ``symm_rank_offset_<peer>``: the byte distance from this
+ranks' replicas through ``symm_rank_offsets[peer]``: the byte distance from this
 rank's replica to the peer's, as the GPU launcher computes it from the
 symmetric-memory handle.
 
@@ -294,8 +294,9 @@ def rank_inputs(shape: Shape = Shape(), *, seed: int = 4800) -> tuple[list[dict]
     for rank, row in enumerate(rows):
         offsets = symm.peer_offsets(rank)
         row["symm_buffer"] = symm
-        row.update({f"symm_rank_offset_{peer}": offsets[peer] if peer < shape.world
-                    else np.int64(0) for peer in range(MAX_RANKS)})
+        row["symm_rank_offsets"] = np.array(
+            [offsets[peer] if peer < shape.world else 0 for peer in range(MAX_RANKS)], dtype=np.int64
+        )
 
     every = {name: np.concatenate([d[name] for d in data]) for name in
              ("l1_codes", "l2_codes", "l1_scale_exponents", "l2_scale_exponents")}

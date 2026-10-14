@@ -25,6 +25,7 @@ from .bindings import (
 from .errors import NumSimExecutionError, UnsupportedTIRxError
 from .host_abi import HostAbiContract, HostBindingSlot, build_host_abi
 from .transpiler.frontend import _extract_topology
+from .transpiler.parameter_buffers import snapshot_parameter_inputs
 from .transpiler.source_map import (
     deserialize_source_span,
     flatten_source_span,
@@ -152,6 +153,7 @@ def prepare_native_bindings(
         return _prepare_native_rank_bindings(
             contract,
             inputs,
+            spec=module.spec,
             evidence_inputs=evidence_inputs,
             supplemental_scalar_dtypes=supplemental_scalar_dtypes,
             _defer_identity=_defer_identity,
@@ -163,6 +165,7 @@ def prepare_native_bindings(
     supplemental_scalar_dtypes = dict(supplemental_scalar_dtypes or {})
 
     canonical = _canonicalize_inputs(contract, public_inputs)
+    canonical = snapshot_parameter_inputs(module.spec, contract, canonical)
     supplemental_inputs = {
         name: public_evidence_inputs[name]
         for name in supplemental_scalar_dtypes
@@ -240,6 +243,7 @@ def _prepare_native_rank_bindings(
     contract: HostAbiContract,
     inputs: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     *,
+    spec: Any,
     evidence_inputs: Any,
     supplemental_scalar_dtypes: dict[str, str] | None,
     _defer_identity: bool,
@@ -251,6 +255,9 @@ def _prepare_native_rank_bindings(
     supplemental_scalar_dtypes = dict(supplemental_scalar_dtypes or {})
     evidence_ranks = list(inputs if evidence_inputs is None else evidence_inputs)
     canonical_ranks = [_canonicalize_inputs(contract, dict(rank_inputs)) for rank_inputs in inputs]
+    canonical_ranks = [
+        snapshot_parameter_inputs(spec, contract, canonical) for canonical in canonical_ranks
+    ]
     supplemental_inputs = {
         rank_binding_name(name, rank): evidence[name]
         for rank, evidence in enumerate(evidence_ranks)

@@ -26,6 +26,7 @@ The tested forms are:
 | Bulk copies | `cp.async.bulk` global to shared (`mbarrier::complete_tx`) and shared to global (`bulk_group`) |
 | TMA | `cp.async.bulk.tensor` loads and stores through a `TensorMap` over a peer's replica |
 | Polls | `T.cuda.wait_until(scope="sys")` and `atom.cas` spins |
+| By-value parameter inputs | Fixed contiguous `local.param` arrays of 1–1024 scalar `int32/uint32/int64/uint64/float32/float64` values; read-only and rank-private |
 
 ## Semantics checked
 
@@ -72,6 +73,11 @@ shared memory, barriers, and grid coordinates.
    An unnamed write invalidates the old name only for bytes it overwrites.
    Untouched bytes and earlier findings remain; unnamed reads do not erase
    provenance. These accesses still undergo the physical race checks above.
+8. **By-value parameters:** each rank sees a launch-time snapshot, not a live
+   alias of another input/output binding. Reads are bounds-checked. Stores,
+   address escape, noncontiguous layouts, and unsupported extents/types fail
+   closed. The snapshot policy survives artifact-cache reloads and applies
+   identically to NumSim, Racecheck, and Synccheck.
 
 The tables below pair these rules with positive controls and counterexamples.
 See the [PTX memory model](https://docs.nvidia.com/cuda/parallel-thread-execution/#memory-consistency-model)
@@ -83,6 +89,19 @@ including the shared-pool provenance invalidation. Release builds must execute
 the byte-occupancy clear independently of debug assertions.
 
 ## Related tests
+
+`tests/numsim/integration/test_parameter_buffers.py` checks all supported
+element types, four-rank private values, NumPy alias detachment, bounds,
+read-only/escape counterexamples, and persistent snapshot metadata. Its two
+native-checker controls require clean reports without changing caller arrays.
+
+`tests/numsim/runtime/test_wait_until.py` requires both raw and declared
+strong-word polls to be race-free; a single read is not proof of freshness.
+`tests/analysis_tools/racecheck/test_signal_diagnostics.py` retains a weak
+publication counterexample and its synchronization hint. The canonical Mega
+MoE case and all six checker-performance configurations require no synthetic
+stale-pool advisory after the completed unnamed overwrite; their numerical,
+completion, and timing checks remain enabled.
 
 `tests/analysis_tools/racecheck/test_strong_flag_reads.py` checks strong
 relaxed/acquire polls against release stores and RMWs with one and two
@@ -115,9 +134,11 @@ instructions (the earlier 31% count was incomplete). The rebuilt generic
 and passes all 14 shapes in the first GPU matrix, with exact output/statistics
 equality and a worst ratio of 1.0092574x (`dsv3_t1`). The independent repeat's
 one-token result is 1.0106940x, outside the 99% gate; parity remains incomplete.
-Further lowering investigation and the other kernels' matrices remain in progress. These
-results require the patched compiler and do not establish parity for the
-unpatched dependency.
+The replacement by-value-array port passes all 14 shapes in both final-source
+rounds, with worst ratios of 1.0085679x / 1.0034897x and exact output/statistics.
+The other three kernels' compiler-regression matrices also pass both rounds.
+These results require the patched compiler and do not establish parity for
+the unpatched dependency.
 
 `tests/numsim/runtime/test_partial_cta.py` and the matching GPU microtests check
 exact thread counts, divergent scalar paths, and untouched absent lanes.
@@ -152,7 +173,7 @@ unordered, not merely an `error` verdict.
 | `tests/numsim/runtime/test_peer.py` | NumSim values: peer stores, loads, atomics, CAS, bulk and TMA in both directions; the reachability errors; `SymmetricBuffer` validation and `peer_offsets`; both ported kernels against their references; the all-gather barrier |
 | `tests/analysis_tools/racecheck/test_native_peer_ordering_rules.py` | The rule table above |
 | `tests/analysis_tools/synccheck/test_native_peer_ordering_rules.py` | Every counterexample still completes (Synccheck checks liveness, not ordering); a rank that never arrives deadlocks its receiver; the reachability errors |
-| `tests/analysis_tools/racecheck/test_native_peer_kernels.py` | Both ported kernels: the all-gather GEMM covers world 2 and 4 with both epilogues and stale-flag counterexamples; Mega MoE's updated contract requires no stale pool advisory after the completed bulk write (Linux rerun pending). |
+| `tests/analysis_tools/racecheck/test_native_peer_kernels.py` | Both ported kernels: the all-gather GEMM covers world 2 and 4 with both epilogues and stale-flag counterexamples; Mega MoE has no stale pool advisory after the completed bulk write. Its complete Linux rerun passes. |
 | `tests/analysis_tools/synccheck/test_native_peer_kernels.py` | Both ported kernels complete; a barrier with a wrong peer offset deadlocks the skipped rank |
 
 The new
@@ -162,7 +183,7 @@ Focused Rust tests in
 [`race_check.rs`](../../src/tirx_harness/numsim/engine-rs/src/native_analysis/racecheck/race_check.rs)
 cover partial overwrites, indexed/tree storage, sparse/contiguous compact
 accesses, other allocations, anonymous reads, and preservation of prior findings.
-The Python regression and complete Mega MoE rerun remain pending; see the
+The Python regression and complete Mega MoE rerun pass; see the
 [implementation explanation](#shared-pool-alias-advisory).
 
 ## Using it
@@ -306,10 +327,11 @@ finding. The advisory's stale writer name came from the following sequence:
 
 ### ABI
 
-`NUMSIM_ABI_VERSION` is 41, in both `numsim/abi.py` and
+`NUMSIM_ABI_VERSION` is 42, in both `numsim/abi.py` and
 `engine-rs/src/lib.rs`: version 40 added `rank_mappings`; version 41 adds exact
 CTA thread counts and partial-warp masks. The baseline's one-thread kernels
-are not padded to a warp to accommodate the simulator.
+are not padded to a warp to accommodate the simulator. Version 42 preserves
+launch-time by-value parameter snapshots across bindings and artifact caches.
 
 ## Ported kernels
 
@@ -356,7 +378,8 @@ The port reproduces DeepGEMM's block-configuration heuristic, stage count,
 register split, warp roles, task scheduler (shared L1, then routed tasks,
 then shared L2), and grid-sync and NVLink-barrier structure. Its outputs and
 cumulative expert statistics match DeepGEMM bit for bit. The kernel reaches
-peers through `symm_rank_offset_<p>` scalars over one `SymmetricBuffer`.
+peers through the by-value `symm_rank_offsets[p]` array over one
+`SymmetricBuffer`, as the reference's parameter struct does.
 `TIRX_DEEPGEMM_NUM_SMS_OVERRIDE` shrinks the grid for NumSim.
 
 ### Where the ports differ from the origins

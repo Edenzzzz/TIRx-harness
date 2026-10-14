@@ -1,64 +1,44 @@
 diff --git a/src/backend/cuda/codegen/codegen_cuda.cc b/src/backend/cuda/codegen/codegen_cuda.cc
-index e7a06977c..35c46b659 100644
+index e7a06977c..d1893ffb3 100644
 --- a/src/backend/cuda/codegen/codegen_cuda.cc
 +++ b/src/backend/cuda/codegen/codegen_cuda.cc
-@@ -192,7 +192,54 @@ void CodeGenCUDA::PrintFunctionSignature(const ffi::String& function_name, const
+@@ -192,7 +192,34 @@ void CodeGenCUDA::PrintFunctionSignature(const ffi::String& function_name, const
      TVM_FFI_THROW(InternalError) << "Unsupported calling convention for cuda codegen: "
                                   << static_cast<int>(calling_conv);
    }
 -  CodeGenC::PrintFunctionSignature(function_name, func, os);
-+  scalar_parameter_members_.clear();
-+  auto groups = ScalarParameterGroups(func);
-+  if (groups.empty()) {
++  auto arrays = ByValueParameterBuffers(func);
++  if (arrays.empty()) {
 +    CodeGenC::PrintFunctionSignature(function_name, func, os);
 +    return;
 +  }
 +  PrimFunc signature = func;
-+  ffi::Array<tirx::Var> parameters;
 +  ffi::Array<tirx::Var> constants;
 +  ffi::Map<tirx::Var, ffi::String> parameter_types;
-+  std::vector<std::pair<size_t, tirx::Var>> vectors;
-+  size_t group_index = 0;
-+  for (size_t index = 0; index < func->params.size();) {
-+    if (group_index < groups.size() && groups[group_index] == index) {
-+      PrimType dtype = func->params[index]->ty.as_or_throw<PrimType>();
-+      tirx::Var vector("__tirx_scalar_table_" + std::to_string(group_index), dtype.WithLanes(4));
-+      vectors.emplace_back(index, vector);
-+      scalar_parameter_vectors_.push_back(vector);
-+      parameters.push_back(vector);
-+      constants.push_back(vector);
-+      std::string array_type = "__tirx_scalar_array_" + std::to_string(dtype.code()) + "_" +
-+                               std::to_string(dtype.bits());
-+      std::ostringstream array_definition;
-+      array_definition << "struct alignas(16) " << array_type << " { ";
-+      PrintType(dtype, array_definition);
-+      array_definition << " values[4]; };\n";
-+      AddUtilFunction(array_type, array_definition.str());
-+      parameter_types.Set(vector, array_type);
-+      ++group_index;
-+      index += 4;
-+    } else {
-+      parameters.push_back(func->params[index++]);
-+    }
++  for (const auto& [index, array] : arrays) {
++    auto parameter = func->params[index];
++    auto dtype = array.dtype;
++    std::string array_type = "__tirx_byval_array_" + std::to_string(dtype.code()) + "_" +
++                             std::to_string(dtype.bits()) + "_" + std::to_string(array.elements);
++    std::ostringstream definition;
++    definition << "struct alignas(" << dtype.bits() / 8 << ") " << array_type << " { ";
++    PrintType(dtype, definition);
++    definition << " values[" << array.elements << "]; };\n";
++    AddUtilFunction(array_type, definition.str());
++    parameter_types.Set(parameter, array_type);
++    constants.push_back(parameter);
 +  }
-+  signature.CopyOnWrite()->params = parameters;
 +  signature = WithAttr(signature, "tirx.cuda.grid_constant_params", constants);
 +  signature = WithAttr(signature, "tirx.cuda.parameter_c_types", parameter_types);
 +  CodeGenC::PrintFunctionSignature(function_name, signature, os);
-+  for (const auto& [start, vector] : vectors) {
-+    std::string name = GetVarID(vector.get());
-+    PrimType dtype = func->params[start]->ty.as_or_throw<PrimType>();
-+    for (size_t field = 0; field < 4; ++field) {
-+      const auto* original = func->params[start + field].get();
-+      var_idmap_[original] = "(" + name + ".values[" + std::to_string(field) + "])";
-+      scalar_parameter_members_.insert_or_assign(original,
-+                                                 ScalarParameterMember{name, field, dtype});
-+    }
++  for (const auto& [index, array] : arrays) {
++    auto parameter = func->params[index];
++    var_idmap_[parameter.get()] = "(" + GetVarID(parameter.get()) + ".values)";
 +  }
  }
 
  class ThreadIdxExtractor : public tirx::StmtExprVisitor {
-@@ -206,6 +253,7 @@ class ThreadIdxExtractor : public tirx::StmtExprVisitor {
+@@ -206,6 +233,7 @@ class ThreadIdxExtractor : public tirx::StmtExprVisitor {
    ffi::Optional<VisitInterrupt> Visit_(const AttrStmtNode* op) final {
      if (op->attr_key == tirx::attr::thread_extent) {
        IterVar iv = op->node.as_or_throw<IterVar>();
@@ -66,7 +46,7 @@ index e7a06977c..35c46b659 100644
        if (iv->var->name == "threadIdx.x" || iv->thread_tag == "threadIdx.x") {
          threadIdx_x_ext = op->value.as_or_throw<PrimExpr>();
        }
-@@ -229,6 +277,7 @@ class ThreadIdxExtractor : public tirx::StmtExprVisitor {
+@@ -229,6 +257,7 @@ class ThreadIdxExtractor : public tirx::StmtExprVisitor {
    }
 
   public:
@@ -74,7 +54,7 @@ index e7a06977c..35c46b659 100644
    PrimExpr threadIdx_x_ext = IntImm::Int32(1);
    PrimExpr threadIdx_y_ext = IntImm::Int32(1);
    PrimExpr threadIdx_z_ext = IntImm::Int32(1);
-@@ -240,6 +289,7 @@ class ThreadIdxExtractor : public tirx::StmtExprVisitor {
+@@ -240,6 +269,7 @@ class ThreadIdxExtractor : public tirx::StmtExprVisitor {
  void CodeGenCUDA::PrintExtraAttrs(const PrimFunc& f, std::ostream& os) {
    auto extractor = ffi::make_object<ThreadIdxExtractor>();
    extractor->Visit(f->body);
@@ -82,7 +62,7 @@ index e7a06977c..35c46b659 100644
    sym::Analyzer analyzer;
    PrimExpr threadIdx_ext = analyzer->Simplify(
        extractor->threadIdx_x_ext * extractor->threadIdx_y_ext * extractor->threadIdx_z_ext);
-@@ -361,6 +411,10 @@ void CodeGenCUDA::Dispatch_(const tirx::ForNode* op) {
+@@ -361,6 +391,10 @@ void CodeGenCUDA::Dispatch_(const tirx::ForNode* op) {
        stream << " " << count->value;
      }
      stream << "\n";
@@ -93,7 +73,7 @@ index e7a06977c..35c46b659 100644
    }
    PrintIndent();
    std::string vid = AllocVarID(op->loop_var.get());
-@@ -399,6 +453,8 @@ void CodeGenCUDA::Dispatch_(const WhileNode* op) {
+@@ -399,6 +433,8 @@ void CodeGenCUDA::Dispatch_(const WhileNode* op) {
  void CodeGenCUDA::BindThreadIndex(const IterVar& iv) {
    TVM_FFI_ICHECK(!var_idmap_.count(iv->var.get()));
    const auto& scope = runtime::ThreadScope::Create(iv->thread_tag);
@@ -102,7 +82,7 @@ index e7a06977c..35c46b659 100644
    if (scope.IsClusterCtaIdx()) {
      TVM_FFI_ICHECK_GE(scope.dim_index, 0);
      TVM_FFI_ICHECK_LT(scope.dim_index, 3);
-@@ -415,10 +471,36 @@ void CodeGenCUDA::BindThreadIndex(const IterVar& iv) {
+@@ -415,10 +451,36 @@ void CodeGenCUDA::BindThreadIndex(const IterVar& iv) {
                                     ";\" : \"=r\"(ctaid) :);\n"
                                     "  return ctaid;\n"
                                     "}\n");
@@ -140,59 +120,28 @@ index e7a06977c..35c46b659 100644
  }
 
  void CodeGenCUDA::PrintType(const PrimType& t, std::ostream& os) {  // NOLINT(*)
-@@ -1924,6 +2006,27 @@ void CodeGenCUDA::Dispatch_(const prim::BroadcastNode* op, std::ostream& os) {
-
- void CodeGenCUDA::Dispatch_(const prim::SelectNode* op, std::ostream& os) {
-   PrimType op_ty = op->ty.as_or_throw<PrimType>();
-+  if (op_ty.IsScalar()) {
-+    auto table = MatchScalarParameterTable(op);
-+    if (table && IsSafeScalarTableIndex(table->selector)) {
-+      auto first = scalar_parameter_members_.find(table->values[0].get());
-+      bool matches = first != scalar_parameter_members_.end() && first->second.index == 0;
-+      for (size_t field = 1; matches && field < 4; ++field) {
-+        auto member = scalar_parameter_members_.find(table->values[field].get());
-+        matches = member != scalar_parameter_members_.end() && member->second.index == field &&
-+                  member->second.name == first->second.name;
-+      }
-+      if (matches) {
-+        std::string index = PrintExpr(table->selector);
-+        os << first->second.name << ".values[((";
-+        if (table->selector.ty().MatchesCode(DLDataTypeCode::kDLInt)) {
-+          os << index << ") >= 0 && (";
-+        }
-+        os << index << ") < 4) ? (" << index << ") : 0]";
-+        return;
-+      }
-+    }
-+  }
-   // Non-vector cases.
-   if (!op_ty.IsFixedLengthVector()) {
-     CodeGenC::Dispatch_(op, os);
 diff --git a/src/backend/cuda/codegen/codegen_cuda.h b/src/backend/cuda/codegen/codegen_cuda.h
-index c7703f9e0..e5887b812 100644
+index c7703f9e0..1a73b4ff5 100644
 --- a/src/backend/cuda/codegen/codegen_cuda.h
 +++ b/src/backend/cuda/codegen/codegen_cuda.h
-@@ -108,6 +108,15 @@ class CodeGenCUDA final : public CodeGenC {
+@@ -108,6 +108,7 @@ class CodeGenCUDA final : public CodeGenC {
    // This is only semantics-preserving for effectively 1-D clusters where the
    // y/z cluster-CTA extents are both one.
    bool cluster_cta_x_is_linear_rank_{false};
 +  std::unordered_map<std::string, PrimExpr> thread_index_extents_;
-+
-+  struct ScalarParameterMember {
-+    std::string name;
-+    size_t index;
-+    PrimType dtype;
-+  };
-+  std::unordered_map<const VarNode*, ScalarParameterMember> scalar_parameter_members_;
-+  std::vector<tirx::Var> scalar_parameter_vectors_;
 
    // Whether the function being generated is a __global__ kernel entry
    // (kDeviceKernelLaunch); __device__ subroutines return real values.
 diff --git a/src/runtime/metadata.h b/src/runtime/metadata.h
-index ce40f8157..fcdfb7cbc 100644
+index ce40f8157..64e1acb23 100644
 --- a/src/runtime/metadata.h
 +++ b/src/runtime/metadata.h
-@@ -60,7 +60,12 @@ constexpr const char* kUseRequiredBlockDimension = "tirx.use_required_block_dime
+@@ -56,11 +56,18 @@ constexpr const char* kUseProgramaticDependentLaunch = "tirx.use_programtic_depe
+ constexpr const char* kUseCooperativeLaunch = "tirx.use_cooperative_launch";
+ /*! \brief A tag to launch with CUDA's statically required block dimension */
+ constexpr const char* kUseRequiredBlockDimension = "tirx.use_required_block_dimension";
++constexpr const char* kRequireByValueParameters = "tirx.by_value_parameters_v1";
+
  }  // namespace launch_param
 
  /*! \brief Extra tags for function arguments */
@@ -201,88 +150,62 @@ index ce40f8157..fcdfb7cbc 100644
 +  kNone = 0,
 +  kTensorMap = 1,
 +  kScalarGroupStart = 2,
-+  kScalarGroupMember = 3
++  kScalarGroupMember = 3,
++  kByValueBuffer = 4
 +};
 
  /*! \brief function information needed by device */
  class FunctionInfoObj : public ffi::Object {
 diff --git a/src/runtime/pack_args.h b/src/runtime/pack_args.h
-index 0cbb631b1..e5c76baeb 100644
+index 0cbb631b1..bf035344e 100644
 --- a/src/runtime/pack_args.h
 +++ b/src/runtime/pack_args.h
-@@ -34,6 +34,7 @@
- #include <tvm/ffi/function.h>
- #include <tvm/runtime/base.h>
-
-+#include <array>
- #include <cstring>
- #include <vector>
-
-@@ -319,6 +320,59 @@ inline ffi::Function PackFuncVoidAddr(F f, const ffi::Array<DLDataType>& arg_typ
+@@ -312,13 +312,24 @@ template <typename F>
+ inline ffi::Function PackFuncVoidAddr(F f, const ffi::Array<DLDataType>& arg_types,
+                                       const ffi::Array<ArgExtraTags>& arg_extra_tags) {
+   std::vector<detail::ArgConvertCode> codes(arg_types.size());
++  bool has_by_value_buffer = false;
+   for (size_t i = 0; i < arg_types.size(); ++i) {
+-    if (arg_extra_tags.size() > i && arg_extra_tags[i] == ArgExtraTags::kTensorMap) {
++    if (arg_extra_tags.size() > i && (arg_extra_tags[i] == ArgExtraTags::kScalarGroupStart ||
++                                      arg_extra_tags[i] == ArgExtraTags::kScalarGroupMember)) {
++      TVM_FFI_THROW(InternalError) << "Obsolete scalar parameter groups; rebuild the kernel";
++    }
++    has_by_value_buffer |=
++        arg_extra_tags.size() > i && arg_extra_tags[i] == ArgExtraTags::kByValueBuffer;
++    if (arg_extra_tags.size() > i && (arg_extra_tags[i] == ArgExtraTags::kTensorMap ||
++                                      arg_extra_tags[i] == ArgExtraTags::kByValueBuffer)) {
+       codes[i] = detail::HANDLE_TO_TENSORMAP;
+     } else {
        codes[i] = detail::GetArgConvertCode(arg_types[i]);
      }
    }
-+  std::vector<std::pair<size_t, size_t>> scalar_groups;
-+  for (size_t index = 0; index < arg_extra_tags.size(); ++index) {
-+    if (arg_extra_tags[index] == ArgExtraTags::kScalarGroupMember) {
-+      TVM_FFI_THROW(InternalError) << "Scalar parameter group has no start";
-+    }
-+    if (arg_extra_tags[index] != ArgExtraTags::kScalarGroupStart) continue;
-+    TVM_FFI_ICHECK_LE(index + 4, arg_types.size());
-+    TVM_FFI_ICHECK_LE(index + 4, arg_extra_tags.size());
-+    const auto& dtype = arg_types[index];
-+    TVM_FFI_ICHECK(dtype.lanes == 1 && (dtype.bits == 32 || dtype.bits == 64));
-+    for (size_t field = 1; field < 4; ++field) {
-+      TVM_FFI_ICHECK(arg_extra_tags[index + field] == ArgExtraTags::kScalarGroupMember);
-+      TVM_FFI_ICHECK(arg_types[index + field].code == dtype.code &&
-+                     arg_types[index + field].bits == dtype.bits &&
-+                     arg_types[index + field].lanes == 1);
-+    }
-+    scalar_groups.emplace_back(index, dtype.bits / 8);
-+    index += 3;
-+  }
-+  if (!scalar_groups.empty()) {
-+    struct alignas(16) ScalarGroupStorage {
-+      std::array<unsigned char, 32> bytes;
-+    };
-+    auto pack_grouped = [&]<int size>() {
-+      auto grouped = [f, scalar_groups, count = arg_types.size()](
-+                         ffi::PackedArgs args, ffi::Any* result, void** addresses) {
-+        detail::TempArray<ScalarGroupStorage, size / 4> storage_(scalar_groups.size());
-+        detail::TempArray<void*, size> regrouped_(count);
-+        ScalarGroupStorage* storage = storage_.data();
-+        void** regrouped = regrouped_.data();
-+        size_t group_index = 0;
-+        size_t output_index = 0;
-+        for (size_t index = 0; index < count;) {
-+          if (group_index < scalar_groups.size() && scalar_groups[group_index].first == index) {
-+            size_t bytes = scalar_groups[group_index].second;
-+            for (size_t field = 0; field < 4; ++field) {
-+              std::memcpy(storage[group_index].bytes.data() + field * bytes,
-+                          addresses[index + field], bytes);
-+            }
-+            regrouped[output_index++] = storage[group_index].bytes.data();
-+            ++group_index;
-+            index += 4;
-+          } else {
-+            regrouped[output_index++] = addresses[index++];
-+          }
-+        }
-+        f(args, result, regrouped);
-+      };
-+      return detail::PackFuncVoidAddr_<size>(grouped, codes);
-+    };
-+    return arg_types.size() <= 32 ? pack_grouped.template operator()<32>()
-+                                  : pack_grouped.template operator()<0>();
++  if (has_by_value_buffer && arg_types.size() <= 32) {
++    return detail::PackFuncVoidAddr_<32>(f, codes);
 +  }
    size_t num_void_args = arg_types.size();
    // specialization
    if (num_void_args <= 4) {
+diff --git a/src/runtime/thread_storage_scope.h b/src/runtime/thread_storage_scope.h
+index 92be05a39..b41e105cc 100644
+--- a/src/runtime/thread_storage_scope.h
++++ b/src/runtime/thread_storage_scope.h
+@@ -288,7 +288,9 @@ class LaunchParamConfig {
+     std::vector<bool> filled(12, false);
+     for (size_t i = 0; i < launch_param_tags.size(); ++i) {
+       std::string tag(launch_param_tags[i]);
+-      if (tag == launch_param::kUseDynamicSharedMemoryTag) {
++      if (tag == launch_param::kRequireByValueParameters) {
++        continue;
++      } else if (tag == launch_param::kUseDynamicSharedMemoryTag) {
+         TVM_FFI_ICHECK_EQ(i, launch_param_tags.size() - 1)
+             << "kUseDynamicSharedMemoryTag should be the last tag in launch_param_tags.";
+         use_dyn_shared_memory_ = true;
 diff --git a/src/target/build_common.h b/src/target/build_common.h
-index a12cca310..2ad162e59 100644
+index a12cca310..7aff66571 100644
 --- a/src/target/build_common.h
 +++ b/src/target/build_common.h
-@@ -29,18 +29,155 @@
+@@ -29,11 +29,15 @@
  #include <tvm/ir/module.h>
  #include <tvm/ir/prim/expr.h>
  #include <tvm/target/codegen.h>
@@ -295,127 +218,93 @@ index a12cca310..2ad162e59 100644
  #include <tvm/tirx/type.h>
 
 +#include <map>
-+#include <optional>
-+#include <set>
  #include <string>
-+#include <vector>
 
  #include "../runtime/metadata.h"
-
+@@ -41,6 +45,96 @@
  namespace tvm {
  namespace codegen {
 
-+struct ScalarParameterTable {
-+  PrimExpr selector;
-+  ffi::Array<tirx::Var> values;
++struct ByValueParameterBuffer {
++  PrimType dtype;
++  int64_t elements;
 +};
 +
-+inline std::optional<ScalarParameterTable> MatchScalarParameterTable(
-+    const prim::SelectNode* source) {
-+  std::optional<PrimExpr> selector;
-+  std::map<int, tirx::Var> values;
-+  PrimExpr current = ffi::GetRef<PrimExpr>(source);
-+  while (const auto* selected = current.as<prim::SelectNode>()) {
-+    const auto* condition = selected->condition.as<prim::EQNode>();
-+    auto value = selected->true_value.as<tirx::Var>();
-+    if (!condition || !value) return std::nullopt;
-+    const auto* index = condition->b.as<prim::IntImmNode>();
-+    PrimExpr expression = condition->a;
-+    if (!index) {
-+      index = condition->a.as<prim::IntImmNode>();
-+      expression = condition->b;
-+    }
-+    if (!index) return std::nullopt;
-+    auto constant = index->value.as<int64_t>();
-+    if (!constant || *constant < 1 || *constant > 3) return std::nullopt;
-+    if (selector && !prim::ExprDeepEqual()(*selector, expression)) return std::nullopt;
-+    selector = expression;
-+    if (!values.emplace(static_cast<int>(*constant), *value).second) return std::nullopt;
-+    current = selected->false_value;
-+  }
-+  auto fallback = current.as<tirx::Var>();
-+  if (!fallback || !selector || values.size() != 3) return std::nullopt;
-+  values.emplace(0, *fallback);
-+  ffi::Array<tirx::Var> fields;
-+  for (int index = 0; index < 4; ++index) fields.push_back(values.at(index));
-+  return ScalarParameterTable{*selector, fields};
-+}
-+
-+class ScalarTableIndexValidator : public tirx::StmtExprVisitor {
-+ public:
-+  bool valid{true};
-+
-+ private:
-+  ffi::Optional<VisitInterrupt> Visit_(const TensorLoadNode* op) final {
-+    auto buffer = op->source.as<tirx::BufferVar>();
-+    if (!buffer || buffer->scope() != "local") {
-+      valid = false;
-+      return std::nullopt;
-+    }
-+    return StmtExprVisitor::Visit_(op);
-+  }
-+
-+  ffi::Optional<VisitInterrupt> Visit_(const CallNode* op) final {
-+    auto expression = ffi::GetRef<Expr>(op).as<PrimExpr>();
-+    if (!expression || SideEffect(*expression) > CallEffectKind::kPure) {
-+      valid = false;
-+      return std::nullopt;
-+    }
-+    return StmtExprVisitor::Visit_(op);
-+  }
-+};
-+
-+inline bool IsSafeScalarTableIndex(const PrimExpr& expression) {
-+  PrimType dtype = expression.ty();
-+  if (!dtype.IsScalar() || !dtype.MatchesCode(DLDataTypeCode::kDLInt, DLDataTypeCode::kDLUInt)) {
-+    return false;
-+  }
-+  auto validator = ffi::make_object<ScalarTableIndexValidator>();
-+  validator->Visit(expression);
-+  return validator->valid;
-+}
-+
-+inline std::vector<size_t> ScalarParameterGroups(const tirx::PrimFunc& function) {
++inline std::map<size_t, ByValueParameterBuffer> ByValueParameterBuffers(
++    const tirx::PrimFunc& function) {
 +  auto target = function->GetAttr<Target>(tvm::attr::kTarget);
 +  if (!target || target.value()->kind->name != "cuda" ||
 +      function->GetAttr<CallingConv>(tvm::attr::kCallingConv, CallingConv::kDefault).value() !=
-+          CallingConv::kDeviceKernelLaunch) {
++          CallingConv::kDeviceKernelLaunch)
 +    return {};
-+  }
 +  struct Collector : tirx::StmtExprVisitor {
 +    explicit Collector(tirx::PrimFunc function) : function(std::move(function)) {}
 +    tirx::PrimFunc function;
-+    std::set<size_t> starts;
-+    std::set<const VarNode*> escaped;
++    std::map<size_t, ByValueParameterBuffer> arrays;
 +
-+    ffi::Optional<VisitInterrupt> Visit_(const prim::SelectNode* op) final {
-+      auto table = MatchScalarParameterTable(op);
-+      if (table && IsSafeScalarTableIndex(table->selector)) {
-+        for (size_t start = 0; start + 4 <= function->params.size(); ++start) {
-+          bool matches = true;
-+          auto dtype = function->params[start]->ty.as<PrimType>();
-+          if (!dtype || !dtype->IsScalar() || (dtype->bits() != 32 && dtype->bits() != 64) ||
-+              !(dtype->MatchesCode(DLDataTypeCode::kDLInt, DLDataTypeCode::kDLUInt,
-+                                   DLDataTypeCode::kDLFloat))) {
-+            continue;
-+          }
-+          for (size_t field = 0; field < 4; ++field) {
-+            matches &= function->params[start + field].same_as(table->values[field]) &&
-+                       function->params[start + field]->ty == *dtype;
-+          }
-+          if (matches) starts.insert(start);
++    ffi::Optional<VisitInterrupt> Visit_(const tirx::DeclBufferNode* op) final {
++      if (op->buffer.scope() != "local.param") return StmtExprVisitor::Visit_(op);
++      const auto* data = op->data.as<VarNode>();
++      TVM_FFI_CHECK(data, ValueError) << "By-value parameter buffers require a direct parameter";
++      auto dtype = op->buffer->dtype;
++      TVM_FFI_CHECK(dtype.IsScalar() && (dtype.bits() == 32 || dtype.bits() == 64) &&
++                        dtype.MatchesCode(DLDataTypeCode::kDLInt, DLDataTypeCode::kDLUInt,
++                                          DLDataTypeCode::kDLFloat),
++                    ValueError)
++          << "Unsupported by-value parameter element type";
++      TVM_FFI_CHECK(op->buffer->shape.size() == 1 && prim::is_zero(op->buffer->elem_offset),
++                    ValueError)
++          << "By-value parameters require a flat buffer with zero element offset";
++      TVM_FFI_CHECK(
++          (op->buffer->strides.empty() ||
++           (op->buffer->strides.size() == 1 && prim::is_one(op->buffer->strides[0]))) &&
++              (!op->buffer->layout ||
++               ffi::StructuralEqual()(op->buffer->layout.value(),
++                                      tirx::TileLayoutNode::DefaultLayout(op->buffer->shape))),
++          ValueError)
++          << "By-value parameters require a flat contiguous layout";
++      const auto* extent = op->buffer->shape[0].as<prim::IntImmNode>();
++      TVM_FFI_CHECK(extent, ValueError) << "By-value parameters require a constant extent";
++      auto elements = extent->value.as<int64_t>();
++      TVM_FFI_CHECK(elements && *elements > 0 && *elements <= 1024, ValueError)
++          << "Invalid by-value parameter extent";
++      bool found = false;
++      for (size_t index = 0; index < function->params.size(); ++index) {
++        if (function->params[index].get() == data) {
++          TVM_FFI_CHECK(!arrays.count(index), ValueError)
++              << "A by-value parameter may only have one buffer declaration";
++          arrays.emplace(index, ByValueParameterBuffer{dtype, *elements});
++          found = true;
 +        }
 +      }
++      TVM_FFI_CHECK(found, ValueError) << "By-value buffer is not a kernel parameter";
++      return StmtExprVisitor::Visit_(op);
++    }
++
++    ffi::Optional<VisitInterrupt> Visit_(const tirx::BufferStoreNode* op) final {
++      TVM_FFI_CHECK(op->buffer.scope() != "local.param", ValueError)
++          << "By-value parameter buffers are read-only";
 +      return StmtExprVisitor::Visit_(op);
 +    }
 +
 +    ffi::Optional<VisitInterrupt> Visit_(const CallNode* op) final {
 +      const auto* operation = op->op.as<OpNode>();
-+      if (!operation || operation->name == "tirx.address_of" ||
-+          operation->name == "prim.address_of" || operation->name == "tirx.cuda.func_call" ||
-+          operation->name == "tirx.call_extern") {
-+        for (const auto& argument : op->args) {
-+          if (const auto* variable = argument.as<VarNode>()) escaped.insert(variable);
++      for (const auto& argument : op->args) {
++        if (operation &&
++            (operation->name == "tirx.address_of" || operation->name == "prim.address_of")) {
++          if (const auto* load = argument.as<TensorLoadNode>()) {
++            auto buffer = load->source.as<tirx::BufferVar>();
++            TVM_FFI_CHECK(!buffer || buffer->scope() != "local.param", ValueError)
++                << "By-value parameter addresses cannot escape";
++          }
++        }
++        if (const auto* pointer = argument->ty.as<PointerTypeNode>()) {
++          TVM_FFI_CHECK(pointer->storage_scope != "local.param", ValueError)
++              << "By-value parameter addresses cannot escape";
++        }
++        if (auto buffer = argument.as<tirx::BufferVar>()) {
++          TVM_FFI_CHECK(buffer->scope() != "local.param", ValueError)
++              << "By-value parameter addresses cannot escape";
 +        }
 +      }
 +      return StmtExprVisitor::Visit_(op);
@@ -423,39 +312,32 @@ index a12cca310..2ad162e59 100644
 +  };
 +  auto collector = ffi::make_object<Collector>(function);
 +  collector->Visit(function->body);
-+  std::vector<size_t> groups;
-+  for (size_t start : collector->starts) {
-+    if (!groups.empty() && start < groups.back() + 4) continue;
-+    bool escaped = false;
-+    for (size_t field = 0; field < 4; ++field) {
-+      escaped |= collector->escaped.count(function->params[start + field].get()) != 0;
-+    }
-+    if (!escaped) groups.push_back(start);
-+  }
-+  return groups;
++  return collector->arrays;
 +}
 +
  inline ffi::Map<ffi::String, runtime::FunctionInfo> ExtractFuncInfo(const IRModule& mod) {
    ffi::Map<ffi::String, runtime::FunctionInfo> fmap;
 
-@@ -70,6 +207,12 @@ inline ffi::Map<ffi::String, runtime::FunctionInfo> ExtractFuncInfo(const IRModu
+@@ -70,7 +164,14 @@ inline ffi::Map<ffi::String, runtime::FunctionInfo> ExtractFuncInfo(const IRModu
        arg_extra_tags.push_back(is_tensormap(f->params[i]) ? runtime::ArgExtraTags::kTensorMap
                                                            : runtime::ArgExtraTags::kNone);
      }
-+    for (size_t start : ScalarParameterGroups(f)) {
-+      arg_extra_tags.Set(start, runtime::ArgExtraTags::kScalarGroupStart);
-+      for (size_t field = 1; field < 4; ++field) {
-+        arg_extra_tags.Set(start + field, runtime::ArgExtraTags::kScalarGroupMember);
-+      }
++    auto by_value_arrays = ByValueParameterBuffers(f);
++    for (const auto& [index, array] : by_value_arrays) {
++      arg_extra_tags.Set(index, runtime::ArgExtraTags::kByValueBuffer);
 +    }
      ffi::Array<ffi::String> launch_param_tags;
++    if (!by_value_arrays.empty()) {
++      launch_param_tags.push_back(runtime::launch_param::kRequireByValueParameters);
++    }
      if (auto opt = f->GetAttr<ffi::Array<ffi::String>>(tirx::attr::kKernelLaunchParams)) {
        for (const auto& tag : opt.value()) {
+         launch_param_tags.push_back(tag);
 diff --git a/src/target/source/codegen_c.cc b/src/target/source/codegen_c.cc
-index a496cee1b..02d1bd0da 100644
+index a496cee1b..e06078c68 100644
 --- a/src/target/source/codegen_c.cc
 +++ b/src/target/source/codegen_c.cc
-@@ -105,7 +105,17 @@ void CodeGenC::PrintFunctionSignature(const ffi::String& function_name, const Pr
+@@ -105,14 +105,24 @@ void CodeGenC::PrintFunctionSignature(const ffi::String& function_name, const Pr
        }
        return false;
      };
@@ -474,11 +356,19 @@ index a496cee1b..02d1bd0da 100644
        os << "const __grid_constant__ CUtensorMap";
      } else {
        PrintType(v->ty, os);
+     }
+
+     bool no_alias = func->HasNonzeroAttr(tirx::attr::kNoAlias);
+-    bool is_handle = v->ty.as<PointerTypeNode>();
++    bool is_handle = v->ty.as<PointerTypeNode>() && !custom_type;
+     auto* ptr = v->ty.as<PointerTypeNode>();
+     if (ptr && ptr->element_type.as<tirx::TensorMapTypeNode>()) {
+       is_handle = false;
 diff --git a/src/tirx/transform/stmt_simplify.cc b/src/tirx/transform/stmt_simplify.cc
-index fd88f1150..8eab0f1a5 100644
+index fd88f1150..d9aba62fc 100644
 --- a/src/tirx/transform/stmt_simplify.cc
 +++ b/src/tirx/transform/stmt_simplify.cc
-@@ -205,6 +205,42 @@ UnchangedOr<Stmt> StmtSimplifier::Mutate_(const BufferStoreNode* op, InplaceMode
+@@ -205,6 +205,61 @@ UnchangedOr<Stmt> StmtSimplifier::Mutate_(const BufferStoreNode* op, InplaceMode
    return store;
  }
 
@@ -488,9 +378,28 @@ index fd88f1150..8eab0f1a5 100644
 +  const auto* evaluate = statement.as<EvaluateNode>();
 +  if (!evaluate) return statement;
 +  const auto* call = evaluate->value.as<CallNode>();
-+  if (!call || call->args.size() != 4) return statement;
++  if (!call) return statement;
 +  const auto* operation = call->op.as<OpNode>();
-+  if (!operation || operation->name != "tirx.ptx.mov") return statement;
++  if (!operation) return statement;
++  if (operation->name == "tirx.ptx.add_int" && call->args.size() == 6) {
++    const auto* saturation = call->args[3].as<StringImmNode>();
++    const auto* modifier = call->args[4].as<StringImmNode>();
++    const auto* flags = call->args[5].as<StringImmNode>();
++    const auto* destination = call->args[0].as<TensorLoadNode>();
++    auto left = call->args[1].as<PrimExpr>();
++    auto right = call->args[2].as<PrimExpr>();
++    if (saturation && saturation->value.empty() && modifier && modifier->value == "u32" && flags &&
++        flags->value.empty() && destination && left && right &&
++        destination->ty == PrimType::UInt(32) && left->ty() == PrimType::UInt(32) &&
++        right->ty() == PrimType::UInt(32) && SideEffect(*left) <= CallEffectKind::kReadState &&
++        SideEffect(*right) <= CallEffectKind::kReadState) {
++      auto buffer = destination->source.as<BufferVar>();
++      if (buffer && buffer->scope() == "local") {
++        return BufferStore(*buffer, *left + *right, destination->indices, statement->span);
++      }
++    }
++  }
++  if (call->args.size() != 4 || operation->name != "tirx.ptx.mov") return statement;
 +  const auto* modifier = call->args[2].as<StringImmNode>();
 +  const auto* flags = call->args[3].as<StringImmNode>();
 +  if (!modifier || !flags || !flags->value.empty() || modifier->value == "pred") return statement;
@@ -534,8 +443,59 @@ index 37694283e..955302431 100644
    // eliminate useless stores
    UnchangedOr<Stmt> Mutate_(const BufferStoreNode* op, InplaceMode inplace_mode) override;
 
+diff --git a/src/tirx/transform/tvm_ffi_binder.cc b/src/tirx/transform/tvm_ffi_binder.cc
+index 01fd9b39a..c90deaf93 100644
+--- a/src/tirx/transform/tvm_ffi_binder.cc
++++ b/src/tirx/transform/tvm_ffi_binder.cc
+@@ -618,8 +618,22 @@ void TVMFFIABIBuilder::DecodeAllParams() {
+       ffi::reflection::AccessPath param_path = ffi::reflection::AccessPath::Root()
+                                                    ->Extend(AccessStep::ArrayItem(i))
+                                                    ->Attr(ffi::String(buffer.value().name()));
+-      Expr data = DecodeParamDLTensor(buffer.value(), device_type_, device_id_, handle,
+-                                      func_name_ + "." + param->name, param_path);
++      bool by_value = buffer.value().scope() == "local.param";
++      if (by_value) {
++        const auto& value = buffer.value();
++        TVM_FFI_CHECK(value->shape.size() == 1 && is_zero(value->elem_offset) &&
++                          (value->strides.empty() ||
++                           (value->strides.size() == 1 && is_one(value->strides[0]))) &&
++                          (!value->layout ||
++                           ffi::StructuralEqual()(value->layout.value(),
++                                                  TileLayoutNode::DefaultLayout(value->shape))),
++                      ValueError)
++            << "By-value parameters require a flat contiguous layout with zero element offset";
++      }
++      PrimExpr argument_device_type = by_value ? IntImm::Int32(kDLCPU) : device_type_;
++      PrimExpr argument_device_id = by_value ? IntImm::Int32(0) : device_id_;
++      Expr data = DecodeParamDLTensor(buffer.value(), argument_device_type, argument_device_id,
++                                      handle, func_name_ + "." + param->name, param_path);
+       decl_buffers_.push_back(DeclBuffer(buffer.value(), data));
+     }
+   }
+@@ -800,7 +814,7 @@ Expr TVMFFIABIBuilder::DecodeParamDLTensor(const BufferVar& buffer, const PrimEx
+     PrimExpr actual_device_type =
+         TVMStructGet(PrimType::Int(32), handle, 0, builtin::kDLTensorDeviceType);
+     // Use custom assertion for device_type to show human-readable device name
+-    if (const auto* const_dt = device_type_.as<IntImmNode>()) {
++    if (const auto* const_dt = device_type.as<IntImmNode>()) {
+       PrimExpr cond = analyzer_->Simplify(IntImm::Int32(const_dt->value) == actual_device_type);
+       if (!is_one(cond)) {
+         std::string device_name = runtime::DLDeviceType2Str(const_dt->value.as<int>().value());
+@@ -811,10 +825,10 @@ Expr TVMFFIABIBuilder::DecodeParamDLTensor(const BufferVar& buffer, const PrimEx
+       }
+     } else {
+       ffi::reflection::AccessPath device_type_path = param_path->Attr(ffi::String("device_type"));
+-      BindScalar(device_type_, actual_device_type, device_type_path, true);
++      BindScalar(device_type, actual_device_type, device_type_path, true);
+     }
+     ffi::reflection::AccessPath device_id_path = param_path->Attr(ffi::String("device_id"));
+-    BindScalar(device_id_, TVMStructGet(PrimType::Int(32), handle, 0, builtin::kDLTensorDeviceId),
++    BindScalar(device_id, TVMStructGet(PrimType::Int(32), handle, 0, builtin::kDLTensorDeviceId),
+                device_id_path, true);
+   }
+
 diff --git a/tests/python/tirx/codegen/test_codegen_cuda.py b/tests/python/tirx/codegen/test_codegen_cuda.py
-index 04e872c83..541b805cd 100644
+index 04e872c83..2cadeb1a8 100644
 --- a/tests/python/tirx/codegen/test_codegen_cuda.py
 +++ b/tests/python/tirx/codegen/test_codegen_cuda.py
 @@ -364,9 +364,7 @@ def test_tirx_cuda_kernel_return_zero_codegen_is_void_early_return():
@@ -549,7 +509,7 @@ index 04e872c83..541b805cd 100644
      assert "return;" in src
      assert "return 0;" not in src
 
-@@ -416,6 +414,178 @@ def test_serial_disable_unroll_pragma_immediately_precedes_dynamic_for():
+@@ -416,6 +414,241 @@ def test_serial_disable_unroll_pragma_immediately_precedes_dynamic_for():
      assert re.search(r"#pragma unroll 1\s*for \(", src)
 
 
@@ -626,6 +586,69 @@ index 04e872c83..541b805cd 100644
 +    )
 +    simplified = tvm.tirx.transform.StmtSimplify()(tvm.IRModule({"main": kernel}))
 +    assert "T.ptx.mov" not in simplified.script()
++
++
++def _unsigned_register_add(predicate=None):
++    predication = (
++        f", pred=T.uint32({predicate}), preserve_dst=True" if predicate is not None else ""
++    )
++    return tvm.script.from_source(
++        f"""
++@T.prim_func
++def main(source: T.Buffer((32,), "uint32"), output: T.Buffer((32,), "uint32")):
++    T.device_entry()
++    lane = T.thread_id([32])
++    value = T.local_scalar("uint32")
++    value = T.uint32(7)
++    T.ptx.add.u32(value, source[lane], T.uint32(16){predication})
++    output[lane] = value
++""",
++        {"T": T},
++    )
++
++
++def test_plain_unsigned_register_add_is_visible_to_value_simplification():
++    simplified = tvm.tirx.transform.StmtSimplify()(tvm.IRModule({"main": _unsigned_register_add()}))
++    assert "T.ptx.add(" not in simplified.script()
++
++
++@pytest.mark.parametrize("predicate", [0, 1])
++def test_predicated_unsigned_register_add_is_preserved(predicate):
++    simplified = tvm.tirx.transform.StmtSimplify()(
++        tvm.IRModule({"main": _unsigned_register_add(predicate)})
++    )
++    assert "T.ptx.add(" in simplified.script()
++
++
++@pytest.mark.parametrize("saturation, modifier", [("sat", "u32"), ("", "s32"), ("", "u64")])
++def test_ineligible_unsigned_register_add_is_not_hidden(saturation, modifier):
++    temporary = tvm.tirx.decl_buffer((1,), "uint32", scope="local")
++    call = tvm.tirx.call_intrin(
++        "void",
++        "tirx.ptx.add_int",
++        temporary[0],
++        tvm.tirx.IntImm("uint32", 7),
++        tvm.tirx.IntImm("uint32", 16),
++        saturation,
++        modifier,
++        "",
++    )
++    function = tvm.tirx.PrimFunc([], tvm.tirx.Evaluate(call))
++    simplified = tvm.tirx.transform.StmtSimplify()(tvm.IRModule({"main": function}))
++    assert "T.ptx.add(" in simplified.script()
++
++
++@pytest.mark.gpu
++def test_unsigned_register_add_preserves_wraparound():
++    bits = np.resize(np.asarray([0, 1, 0xFFFFFFFF, 0xFFFFFFF0, 0x80000000], dtype="uint32"), 32)
++    architecture = "sm_" + tvm.cuda(0).compute_version.replace(".", "")
++    _, compiled = _get_source(
++        _unsigned_register_add(), target={"kind": "cuda", "arch": architecture}
++    )
++    source = tvm.runtime.tensor(bits, device=tvm.cuda(0))
++    output = tvm.runtime.tensor(np.zeros(32, dtype="uint32"), device=tvm.cuda(0))
++    compiled["main"](source, output)
++    np.testing.assert_array_equal(output.numpy(), (bits.astype("uint64") + 16).astype("uint32"))
 +
 +
 +@pytest.mark.parametrize("predicate", ["T.uint32(0)", "T.uint32(1)"])
@@ -728,95 +751,56 @@ index 04e872c83..541b805cd 100644
  def test_cluster_cta_id_codegen_uses_coordinate_sregs():
      @T.prim_func
      def main(A: T.Buffer((1,), "int32")):
-@@ -432,6 +602,203 @@ def test_cluster_cta_id_codegen_uses_coordinate_sregs():
+@@ -432,6 +665,107 @@ def test_cluster_cta_id_codegen_uses_coordinate_sregs():
      assert "cooperative_groups::cluster_group::block_index" not in src
 
 
-+def _scalar_parameter_table(dtype, global_index=False):
-+    index_parameter = (
-+        ', selector: T.Buffer((32,), "int32")' if global_index else ", selector: T.int32"
-+    )
-+    index_value = "selector[lane]" if global_index else "selector"
++def _by_value_array(dtype, elements):
 +    return tvm.script.from_source(
 +        f'''
 +@T.prim_func
-+def parameter_table(output: T.Buffer((32,), "{dtype}"),
-+                    weight0: T.{dtype}, weight1: T.{dtype},
-+                    weight2: T.{dtype}, weight3: T.{dtype}{index_parameter}):
++def main(output: T.Buffer((32,), "{dtype}"),
++         values: T.Buffer(({elements},), "{dtype}", scope="local.param"), index: T.int32):
 +    T.device_entry()
 +    lane = T.thread_id([32])
-+    index: T.let = {index_value}
-+    output[lane] = T.Select(index == 3, weight3,
-+                    T.Select(index == 2, weight2,
-+                      T.Select(index == 1, weight1, weight0)))
++    output[lane] = values[index]
 +''',
 +        {"T": T},
 +    )
 +
 +
-+@pytest.mark.parametrize("dtype", ["int32", "int64", "float32", "float64"])
-+def test_scalar_parameter_table_uses_one_grid_constant_argument(dtype):
-+    source, _ = _get_source(_scalar_parameter_table(dtype))
-+    assert "const __grid_constant__ __tirx_scalar_array_" in source
-+    assert ".values[" in source
-+    assert "weight0," not in source
-+
-+
-+def test_materialized_global_selector_is_read_once():
-+    source, _ = _get_source(_scalar_parameter_table("int64", global_index=True))
-+    assert "const __grid_constant__ __tirx_scalar_array_" in source
-+    assert len(re.findall(r"selector_ptr\[", source)) == 1
-+
-+
-+@pytest.mark.parametrize(
-+    "order, packed",
-+    [
-+        ((0, 1, 2, 3, 4), True),
-+        ((0, 4, 1, 2, 3), False),
-+        ((1, 0, 2, 3, 4), False),
-+    ],
-+)
-+def test_device_parameter_grouping_requires_contiguous_ordered_members(order, packed, monkeypatch):
-+    weights = [tvm.tirx.Var(f"weight{index}", "int64") for index in range(4)]
-+    selector = tvm.tirx.Var("selector", "int32")
-+    selection = weights[0]
-+    for index in range(1, 4):
-+        selection = tvm.tirx.Select(selector == index, weights[index], selection)
-+    parameters = [*weights, selector]
-+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
-+    function = (
-+        tvm.tirx.PrimFunc([parameters[index] for index in order], tvm.tirx.Evaluate(selection))
-+        .with_attr("global_symbol", "parameter_table")
-+        .with_attr("target", target)
-+        .with_attr("calling_conv", tvm.ir.CallingConv.DEVICE_KERNEL_LAUNCH)
-+    )
-+    monkeypatch.setenv("TVM_COMPILE_FORCE_FALLBACK", "1")
-+    source = tvm.get_global_func("target.build.cuda")(
-+        tvm.IRModule.from_expr(function), target
-+    ).inspect_source()
-+    assert ("__tirx_scalar_array_" in source) == packed
++@pytest.mark.parametrize("dtype", ["int32", "int64", "uint32", "uint64", "float32", "float64"])
++@pytest.mark.parametrize("elements", [4, 72])
++def test_by_value_arrays_use_grid_constant_parameters(dtype, elements):
++    source, _ = _get_source(_by_value_array(dtype, elements))
++    assert "const __grid_constant__ __tirx_byval_array_" in source
++    assert f"values[{elements}]" in source
++    assert ".values)[index]" in source
 +
 +
 +@pytest.mark.gpu
-+@pytest.mark.parametrize("dtype", ["int32", "int64", "float32", "float64"])
-+def test_packed_scalar_parameter_table_preserves_public_argument_values(dtype, tmp_path):
-+    weights = (
-+        [-0.0, 0.125, -3.25, float("inf")]
-+        if dtype.startswith("float")
-+        else [int(np.iinfo(dtype).min), int(np.iinfo(dtype).max), -31, 17]
-+    )
++@pytest.mark.parametrize("dtype", ["int32", "int64", "uint32", "uint64", "float32", "float64"])
++@pytest.mark.parametrize("elements", [4, 72])
++def test_by_value_arrays_copy_cpu_arguments_through_library_reload(dtype, elements, tmp_path):
 +    architecture = "sm_" + tvm.cuda(0).compute_version.replace(".", "")
 +    _, compiled = _get_source(
-+        _scalar_parameter_table(dtype), target={"kind": "cuda", "arch": architecture}
++        _by_value_array(dtype, elements), target={"kind": "cuda", "arch": architecture}
 +    )
-+    library = str(tmp_path / "parameter_table.so")
++    library = str(tmp_path / "by_value_array.so")
 +    compiled.export_library(library)
++    assert b"tirx.by_value_parameters_v1" in tmp_path.joinpath("by_value_array.so").read_bytes()
 +    restored = tvm.runtime.load_module(library)
++    values = (
++        np.resize(np.asarray([-0.0, 0.125, -3.25, float("inf")], dtype=dtype), elements)
++        if dtype.startswith("float")
++        else np.arange(elements, dtype=dtype) * 17
++    )
++    parameters = tvm.runtime.tensor(values, device=tvm.cpu())
 +    output = tvm.runtime.tensor(np.zeros(32, dtype=dtype), device=tvm.cuda(0))
 +    for implementation in (compiled, restored):
-+        for index in [-2, -1, 0, 1, 2, 3, 4, 5]:
-+            implementation["main"](output, *weights, index)
-+            expected = np.full(32, weights[index if 0 <= index < 4 else 0], dtype=dtype)
++        for index in [0, 1, elements - 1]:
++            implementation["main"](output, parameters, index)
++            expected = np.full(32, values[index], dtype=dtype)
 +            if dtype.startswith("float"):
 +                bits = "uint" + dtype.removeprefix("float")
 +                np.testing.assert_array_equal(output.numpy().view(bits), expected.view(bits))
@@ -824,109 +808,52 @@ index 04e872c83..541b805cd 100644
 +                np.testing.assert_array_equal(output.numpy(), expected)
 +
 +
-+def _multiple_parameter_tables():
++def test_by_value_array_writes_are_rejected():
++    @T.prim_func
++    def main(values: T.Buffer((72,), "int64", scope="local.param")):
++        T.device_entry()
++        lane = T.thread_id([32])
++        values[lane] = T.int64(1)
++
++    with pytest.raises(ValueError, match="read-only"):
++        _get_source(main)
++
++
++def test_by_value_array_addresses_cannot_escape():
 +    @T.prim_func
 +    def main(
-+        output: T.Buffer((32,), "int64"),
-+        index: T.int32,
-+        left0: T.int64,
-+        left1: T.int64,
-+        left2: T.int64,
-+        left3: T.int64,
-+        scale: T.int32,
-+        right0: T.float32,
-+        right1: T.float32,
-+        right2: T.float32,
-+        right3: T.float32,
++        output: T.Buffer((32,), "uint64"), values: T.Buffer((72,), "int64", scope="local.param")
 +    ):
 +        T.device_entry()
 +        lane = T.thread_id([32])
-+        left: T.let = T.Select(
-+            index == 3, left3, T.Select(index == 2, left2, T.Select(index == 1, left1, left0))
-+        )
-+        right: T.let = T.Select(
-+            index == 3, right3, T.Select(index == 2, right2, T.Select(index == 1, right1, right0))
-+        )
-+        output[lane] = left + left0 + T.Cast("int64", right * T.Cast("float32", scale))
++        output[lane] = T.reinterpret("uint64", values.ptr_to([0]))
 +
-+    return main
++    with pytest.raises(ValueError, match="addresses cannot escape"):
++        _get_source(main)
 +
 +
-+def test_multiple_parameter_tables_retain_unrelated_arguments():
-+    source, _ = _get_source(_multiple_parameter_tables())
-+    assert source.count("const __grid_constant__ __tirx_scalar_array_") == 4
-+    assert "int scale" in source
-+    assert "int index" in source
-+
-+
-+@pytest.mark.gpu
-+def test_multiple_parameter_tables_launch_and_reload(tmp_path):
-+    architecture = "sm_" + tvm.cuda(0).compute_version.replace(".", "")
-+    _, compiled = _get_source(
-+        _multiple_parameter_tables(), target={"kind": "cuda", "arch": architecture}
-+    )
-+    library = str(tmp_path / "multiple_parameter_tables.so")
-+    compiled.export_library(library)
-+    restored = tvm.runtime.load_module(library)
-+    output = tvm.runtime.tensor(np.zeros(32, dtype="int64"), device=tvm.cuda(0))
-+    left = [2**40 + 3, -(2**40), 31, -17]
-+    right = [0.5, -0.125, 1.25, -3.5]
-+    for implementation in (compiled, restored):
-+        for index in [-1, 0, 1, 2, 3, 4]:
-+            implementation["main"](output, index, *left, 8, *right)
-+            slot = index if 0 <= index < 4 else 0
-+            expected = left[slot] + left[0] + int(right[slot] * 8)
-+            np.testing.assert_array_equal(output.numpy(), np.full(32, expected, dtype="int64"))
-+
-+
-+def _large_parameter_table_list(groups):
-+    parameters = ", ".join(
-+        f"weight_{group}_{slot}: T.int64" for group in range(groups) for slot in range(4)
-+    )
-+    stores = "\n".join(
-+        f"    output[{group}, lane] = T.Select(index == 3, weight_{group}_3, "
-+        f"T.Select(index == 2, weight_{group}_2, "
-+        f"T.Select(index == 1, weight_{group}_1, weight_{group}_0)))"
-+        for group in range(groups)
-+    )
-+    return tvm.script.from_source(
++@pytest.mark.parametrize(
++    "shape, options, indices",
++    [
++        ("(4,)", "strides=(2,)", "index"),
++        ("(2, 2)", "", "0, index"),
++        ("(4,)", "elem_offset=1", "index"),
++    ],
++)
++def test_by_value_arrays_reject_nonplain_layouts_before_flattening(shape, options, indices):
++    function = tvm.script.from_source(
 +        f"""
 +@T.prim_func
-+def main(output: T.Buffer(({groups}, 32), "int64"), index: T.int32, {parameters}):
++def main(output: T.Buffer((32,), "int64"),
++         values: T.Buffer({shape}, "int64", scope="local.param", {options}), index: T.int32):
 +    T.device_entry()
 +    lane = T.thread_id([32])
-+{stores}
++    output[lane] = values[{indices}]
 +""",
 +        {"T": T},
 +    )
-+
-+
-+@pytest.mark.parametrize("groups", [1, 7, 8, 9])
-+def test_parameter_table_count_covers_stack_and_heap_argument_packing(groups):
-+    source, _ = _get_source(_large_parameter_table_list(groups))
-+    assert source.count("const __grid_constant__ __tirx_scalar_array_") == groups * 2
-+
-+
-+@pytest.mark.gpu
-+@pytest.mark.parametrize("groups", [1, 7, 8, 9])
-+def test_parameter_table_stack_and_heap_paths_preserve_values(groups, tmp_path):
-+    architecture = "sm_" + tvm.cuda(0).compute_version.replace(".", "")
-+    _, compiled = _get_source(
-+        _large_parameter_table_list(groups), target={"kind": "cuda", "arch": architecture}
-+    )
-+    library = str(tmp_path / "parameter_tables.so")
-+    compiled.export_library(library)
-+    restored = tvm.runtime.load_module(library)
-+    weights = [(group + 1) * 2**40 - slot * 17 for group in range(groups) for slot in range(4)]
-+    output = tvm.runtime.tensor(np.zeros((groups, 32), dtype="int64"), device=tvm.cuda(0))
-+    for implementation in (compiled, restored):
-+        for index in [-1, 0, 1, 2, 3, 4]:
-+            implementation["main"](output, index, *weights)
-+            slot = index if 0 <= index < 4 else 0
-+            expected = np.repeat(
-+                np.asarray(weights, dtype="int64").reshape(groups, 4)[:, slot, None], 32, axis=1
-+            )
-+            np.testing.assert_array_equal(output.numpy(), expected)
++    with pytest.raises(ValueError, match="By-value parameters require a flat"):
++        _get_source(function)
 +
 +
  @pytest.mark.gpu

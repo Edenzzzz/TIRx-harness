@@ -292,7 +292,7 @@ class TirxMegaMoeInvocation:
     executable: Any
     y: torch.Tensor
     cumulative_local_expert_recv_stats: torch.Tensor
-    symm_buffer_offsets: tuple[int, ...]
+    symm_buffer_offsets: torch.Tensor
     tensor_maps: dict[str, _AlignedTensorMap]
 
 
@@ -1612,7 +1612,8 @@ def _prepare_tirx_invocation(
         executable=_compile_tirx_mega_moe(case),
         y=y,
         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
-        symm_buffer_offsets=_make_symm_buffer_offsets(case),
+        symm_buffer_offsets=torch.tensor(_make_symm_buffer_offsets(case), dtype=torch.int64,
+                                         device="cpu"),
         tensor_maps=tensor_maps,
     )
 
@@ -1635,7 +1636,7 @@ def _launch_tirx_mega_moe(
         invocation.y.view(-1),
         invocation.cumulative_local_expert_recv_stats,
         case.symm_buffer.buffer,
-        *invocation.symm_buffer_offsets,
+        invocation.symm_buffer_offsets,
         tensor_maps["tensor_map_l1_acts"].ptr,
         tensor_maps["tensor_map_l1_acts_sf"].ptr,
         tensor_maps["tensor_map_l1_weights"].ptr,

@@ -23,7 +23,7 @@ The current audit found:
 | Two-shot all-reduce | Preserves the baseline's data layout, constexpr loop/rank, and terminal release/relaxed-CAS protocol. All 18 shapes and the independent repeat now pass bitwise equality, independent-reference precision, flag reset, and the unchanged 99% performance gate. |
 | GEMM + all-reduce | Restored baseline waits, elected leaders, and barrier sequence; removed the added exit GPU fence. All 19 shapes, both origins, three matched configurations, and the independent repeat now meet the unchanged precision/performance gate. `sys_fenced` remains a separate semantic example. |
 | All-gather GEMM | `benchmarks.peer.fidelity` restores CUTLASS's per-shard launches, exact auxiliary kernels, and common host schedule. Both 17-shape GPU rounds pass bitwise/reference correctness and the 99% gate at baseline-selected configurations; worst ratios are 1.001948 / 1.002322. The earlier fused/chunked and NumSim copy-warp variants are separate examples, not fidelity evidence. |
-| Mega MoE | The default retains the reference timeout, load, work-partition, and synchronization schedule, including mask-guarded combine-load warp barriers. `sys_fenced` remains separate. Generic CUDA loop/coordinate/copy/parameter-table lowering now restores direct parameter-based peer-offset reads instead of a port-only shared cache. Its first one-token comparison is 1.001989x with bitwise-equal output/statistics. The final 14-shape matrix and repeat remain open; earlier coordinate-only repeat evidence missed the gate at 1.010694x. The [compiler patch, source, tests, and evidence](lowering/README.md) are explicit prerequisites, not evidence for an unpatched compiler. |
+| Mega MoE | Preserves reference timeout, loads, work partition, and synchronization, including mask-guarded combine-load warp barriers. `sys_fenced` stays separate. Generic CUDA loop/coordinate/register lowering and a read-only by-value parameter array restore reference peer-offset access without a port-only shared cache. All 14 shapes pass both final-source rounds with exact output/statistics and worst ratios 1.0085679 / 1.0034897. The [compiler patch, source, tests, and evidence](lowering/README.md) are explicit prerequisites, not evidence for an unpatched compiler. |
 
 Actual CUTLASS and FlashInfer PTX/CUBIN and TIRx CUBIN were captured with the
 existing compiler under the socket lease. The CUTLASS artifact confirms elected
@@ -76,7 +76,8 @@ The complete four-rank Mega MoE numerical, Racecheck, and Synccheck examples
 now pass, including the previously unbounded shared-pool alias test. After
 restoring parameter-based peer-offset selection without a shared cache, the
 same **four tests pass in 89.83 seconds**, and **26 IR/fidelity gate tests
-pass**. Public scalar arguments and per-rank NumSim bindings are unchanged.
+pass**. That earlier scalar-argument port is superseded by the by-value-array
+port described below.
 The corresponding generic CUDA parameter-table lowering passes its initial
 four-type GPU argument checks; its independent full performance matrix is
 running and remains a separate gate.
@@ -131,10 +132,56 @@ presence of a shape name. Every row is numerically correct and meets 99%:
 
 These kernels have no scalar-parameter table candidates or `tirx.ptx.mov`
 calls in the 802-function scope audit. The later grouped-argument stack path
-does not execute for them. Mega MoE remains the unresolved performance gate:
+does not execute for them. At that stage Mega MoE remained unresolved:
 its stack-packing first tiny-shape comparison is 35.943/35.436 microseconds
 (1.0143075x), despite exact output/statistics. That miss is preserved rather
 than replaced by the passing one-token diagnostic comparisons.
+
+The final Mega MoE port replaces the scalar-selection experiment with one
+read-only, by-value rank-offset array, matching DeepGEMM's parameter storage.
+Plain unsigned local-register addition also becomes visible to normal
+lowering; predication, saturation, and other types remain explicit. No
+instruction upgrade, alternate protocol, work repartition, or schedule change
+is used. The final source stamp is `06dfdd4b74d34861`.
+
+Both independent **14-shape × 11-round** comparisons now pass bitwise
+output/statistics equality and the unchanged 99% gate. Worst ratios are
+**1.0085679 / 1.0034897** (first/repeat). One-token measurements are
+99.351/98.507 and 99.052/99.301 microseconds; the tiny shape is
+36.158/38.252 and 36.249/37.062. Earlier prototype misses remain recorded in
+the [lowering evidence](lowering/README.md#evidence), not relabelled as passes.
+
+NumSim ABI **42** snapshots by-value arrays per rank, preserving that policy
+through native checker bindings, artifact manifests, and cache identity.
+The ABI 42 run passes **106** combined peer numerical/race/sync, parameter,
+ABI, and fidelity tests, including all complete Mega MoE cases; another
+**41** snapshot/cache tests pass. The Rust suite again passes **890 + 4 + 3**
+tests in both debug and release. The compiler suite passes **89 CPU tests
+with one skip** and **15 focused GPU tests**, including all six array types,
+two extents, direct calls, library reloads, special-value bits, and unsigned
+wraparound. New modules explicitly reject older runtimes before launch.
+The broad CPU run completes without a resource guard: **4096 passed, 33
+failed, one xfailed in 953.43 seconds**, using `-n 16 --dist=worksteal` and
+excluding live GPU markers. This is not a green package gate. The pristine
+upstream comparison completes too, but its old `LaunchTopology` constructor
+cannot consume the pinned frontend's `threads_per_cta` field; its widespread
+failures are not a useful blanket explanation of the current failures.
+
+The run exposes stale expectations that strong flag reads must race and that
+completed unnamed Mega MoE writes must retain old named provenance. Those
+expectations are corrected, not used to restore the false positives. The weak
+publication and unrelated-payload negative controls remain. **67** focused
+wait/flag/diagnostic/canonical tests now pass, as do **44** parameter/cache/ABI
+tests. Three compiler layout negative controls fail before their fix and pass
+afterward. The 59 simplifier tests and both source-generation PTX controls
+also pass; the latter use source-only fallback, not a newer assembler.
+
+The broad run's 149.860-second NumSim maximum-case miss remains recorded
+against the unchanged 140-second CPU budget. Archive version metadata and
+Rust compiler stack exhaustion are separate infrastructure failures. A serial,
+like-for-like rerun of the remaining failures against compatible parent
+`ee1d815`, with identical environment fixes, and the final live GPU rerun are
+in progress. No timing threshold is widened to make this run green.
 
 ## Historical evidence
 
