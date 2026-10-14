@@ -92,6 +92,16 @@ worker and four socket-leased GPUs. No cases are skipped. The workers use the
 existing generic CUDA-target helper instead of a fixed device architecture;
 kernel instruction forms and NumSim semantics are unchanged.
 
+A subsequent full-package CPU run selects 4,099 cases but terminates after
+the shared node's root filesystem fills; it is not a full-suite pass. The
+storage failure also interrupts the remaining GPU matrices before they can
+finish. The task workspace is moved, checksum-verified, to executable shared
+memory behind its original path, recovering 19 GB without removing results or
+changing the kernel source stamp (`a3693ef42fc9f8cb`). Completed valid rows are
+retained; incomplete files and failure logs are preserved separately while
+only unfinished comparisons resume under the same socket lease and unchanged
+99% gate. The earlier 943 CPU and 94 GPU passing runs remain separate evidence.
+
 ## Historical evidence
 
 After the ABI update, **138 additional targeted tests pass** for the complete
