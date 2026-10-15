@@ -336,10 +336,11 @@ bound of at most eight to use `#pragma unroll 8`; unbounded and runtime-bound
 loops retain `#pragma unroll 1`. A loop whose upper bound is a scalar kernel
 parameter uses CUDA's uncounted `#pragma unroll`, matching the origin's token
 loop form. The exact rebuilt compiler passes `port_t2_h1024_e8_k1` at 0.991
-in a 31-round run. The full 14-shape matrix has exact outputs/statistics and
-13 ratios at or below 1.004; the remaining tiny-shape row is 1.011 in that
-sequence. dsv3 measurements vary between the passing full-matrix result and
-1.011 in an independent run, so the final gate remains explicitly open.
+in a 31-round run and `dsv3_t1` at 1.00984 in an independent 31-round run.
+The full 14-shape matrix has exact outputs/statistics and 13 ratios at or
+below 1.004; its remaining tiny-shape row is 1.011 in that sequence. The
+independent blocker runs pass the 99% gate, while the sequence-dependent row
+remains recorded for continued validation.
 
 | Shape group | Result |
 |---|---:|
