@@ -339,8 +339,8 @@ loop form. The exact rebuilt compiler passes `port_t2_h1024_e8_k1` at 0.991
 in a 31-round run and `dsv3_t1` at 1.00984 in an independent 31-round run.
 The full 14-shape matrix has exact outputs/statistics and 13 ratios at or
 below 1.004; its remaining tiny-shape row is 1.011 in that sequence. The
-independent blocker runs pass the 99% gate, while the sequence-dependent row
-remains recorded for continued validation.
+independent dsv3 runs now span 1.00984 and 1.01293, while the sequence-
+dependent rows remain recorded for continued validation.
 
 | Shape group | Result |
 |---|---:|
