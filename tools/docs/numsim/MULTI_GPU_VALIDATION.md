@@ -23,7 +23,7 @@ The current audit found:
 | Two-shot all-reduce | Preserves the baseline's data layout, constexpr loop/rank, and terminal release/relaxed-CAS protocol. All 18 shapes and the independent repeat now pass bitwise equality, independent-reference precision, flag reset, and the unchanged 99% performance gate. |
 | GEMM + all-reduce | Restored baseline waits, elected leaders, and barrier sequence; removed the added exit GPU fence. All 19 shapes, both origins, three matched configurations, and the independent repeat now meet the unchanged precision/performance gate. `sys_fenced` remains a separate semantic example. |
 | All-gather GEMM | `benchmarks.peer.fidelity` restores CUTLASS's per-shard launches, exact auxiliary kernels, and common host schedule. Both 17-shape GPU rounds pass bitwise/reference correctness and the 99% gate at baseline-selected configurations; worst ratios are 1.001948 / 1.002322. The earlier fused/chunked and NumSim copy-warp variants are separate examples, not fidelity evidence. |
-| Mega MoE | Preserves reference timeout, loads, work partition, and synchronization, including mask-guarded combine-load warp barriers. `sys_fenced` stays separate. Generic CUDA loop/coordinate/register lowering and a read-only by-value parameter array restore reference peer-offset access without a port-only shared cache. All 14 shapes pass both final-source rounds with exact output/statistics and worst ratios 1.0085679 / 1.0034897. The [compiler patch, source, tests, and evidence](lowering/README.md) are explicit prerequisites, not evidence for an unpatched compiler. |
+| Mega MoE | Preserves reference timeout, loads, work partition, and synchronization, including mask-guarded combine-load warp barriers. `sys_fenced` stays separate. Generic CUDA loop/coordinate/register lowering and a read-only by-value parameter array restore reference peer-offset access without a port-only shared cache. The current source stamp `979bd32f26952708` produces exact outputs/statistics on all 14 shapes, but the fresh NVRTC matrix still records a `dsv3_t1` ratio of 1.011856; full parity remains open. The [compiler patch, source, tests, and evidence](lowering/README.md) are explicit prerequisites, not evidence for an unpatched compiler. |
 
 Actual CUTLASS and FlashInfer PTX/CUBIN and TIRx CUBIN were captured with the
 existing compiler under the socket lease. The CUTLASS artifact confirms elected
@@ -144,18 +144,15 @@ lowering; predication, saturation, and other types remain explicit. No
 instruction upgrade, alternate protocol, work repartition, or schedule change
 is used. The final source stamp is `06dfdd4b74d34861`.
 
-Both independent **14-shape × 11-round** comparisons now pass bitwise
-output/statistics equality and the unchanged 99% gate. Worst ratios are
-**1.0085679 / 1.0034897** (first/repeat). One-token measurements are
-99.351/98.507 and 99.052/99.301 microseconds; the tiny shape is
-36.158/38.252 and 36.249/37.062. Earlier prototype misses remain recorded in
-the [lowering evidence](lowering/README.md#evidence), not relabelled as passes.
-
-The subsequent final-runtime revalidation reopens the Mega MoE gate: its first
-one-token comparison is **98.793/97.277 microseconds (1.0155844x)**, despite
-exact output/statistics and byte-identical CUDA images. The other cases and
-independent repeat continue in separate files. The preceding passing rounds
-do not erase this miss or establish current full parity.
+The current source stamp `979bd32f26952708` produces exact output and
+statistics on all 14 shapes in a fresh four-rank NVRTC matrix. Its ratios are
+within 0.42% on 12 shapes; `dsv3_t1` is **1.011856** and `dsv3_t8192` is
+1.004211, so the matrix does not establish the 99% gate. The result is
+state-sensitive: an isolated 31-round `dsv3_t1` run is 1.007077, and the same
+shape after a large shape plus a 10-second cooldown is 1.000252. The matching
+`port_t2_h1024_e8_k1` cooldown run is 1.048116, so the remaining tiny-shape
+tail is still an open lowering/performance issue rather than a clean pass.
+The earlier passing rounds remain historical evidence and are not relabelled.
 
 For the other three kernels, an additional complete compiler-output audit
 compares all **802** rank/configuration functions between their measured

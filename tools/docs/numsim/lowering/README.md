@@ -32,6 +32,26 @@ The loop emitter adds this fallback after processing explicit unroll hints:
 }
 ```
 
+The corresponding while lowering is in the same class and keeps a dynamic
+trip count opaque to CUDA:
+
+```cpp
+void CodeGenCUDA::Dispatch_(const WhileNode* op) {
+  PrintIndent();
+  stream << "#pragma unroll 1\n";
+  PrintIndent();
+  stream << "while (1) {\n";
+  int while_scope = BeginScope();
+  std::string cond = PrintExpr(op->condition);
+  PrintIndent();
+  stream << "if (!(" << cond << ")) { break; }\n";
+  PrintStmt(op->body);
+  this->EndScope(while_scope);
+  PrintIndent();
+  stream << "}\n";
+}
+```
+
 The original coordinate binding expands every use to the builtin:
 
 ```cpp
@@ -289,6 +309,32 @@ The unchanged 11-round GPU comparison gives:
 Every output and statistic matches exactly. The tiny-shape repeat still
 fails the unchanged 99% gate, so this correction does not close full parity.
 The old misses remain recorded; further lowering investigation is required.
+
+### Current source revalidation
+
+The current source stamp `979bd32f26952708` was rebuilt into a fresh cache and
+run across all 14 declared shapes with the patched generic compiler. Every
+output and cumulative statistic matched bitwise. The ratios were:
+
+| Shape group | Result |
+|---|---:|
+| 12 of 14 shapes | at most 1.004211 |
+| `dsv3_t1` | 1.011856 in the full matrix |
+| `dsv3_t8192` | 1.004211 |
+
+The one-token result is sensitive to the preceding GPU state. An isolated
+31-round `dsv3_t1` run is 1.007077; after `port_t8192_e384_k6` and a 10-second
+cooldown it is 1.000252. The same cooldown protocol leaves
+`port_t2_h1024_e8_k1` at 1.048116. These results keep the full gate open.
+
+The relevant lowering sites remain generic: `Dispatch_(const ForNode*)`
+emits `#pragma unroll 1` for dynamic serial loops or serial loops containing a
+`while`, and `BindThreadIndex` caches native thread/block/cluster coordinates
+with their launch bounds. `Dispatch_(const WhileNode*)` retains the dynamic
+loop guard. These paths do not inspect Mega MoE names or shapes. The tiny
+shape's remaining tail is therefore not attributed to extra static SASS; the
+fresh diagnostics require another lowering investigation before claiming
+parity.
 
 ### Timeline evidence
 

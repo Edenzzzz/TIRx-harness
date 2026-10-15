@@ -134,11 +134,11 @@ instructions (the earlier 31% count was incomplete). The rebuilt generic
 and passes all 14 shapes in the first GPU matrix, with exact output/statistics
 equality and a worst ratio of 1.0092574x (`dsv3_t1`). The independent repeat's
 one-token result is 1.0106940x, outside the 99% gate; parity remains incomplete.
-The replacement by-value-array port passes all 14 shapes in both final-source
-rounds, with worst ratios of 1.0085679x / 1.0034897x and exact output/statistics.
-The subsequent final-runtime one-token comparison is 1.0155844x with exact
-output/statistics, so the current Mega MoE parity gate remains open. Earlier
-passing rounds do not erase that new miss.
+The replacement by-value-array port produces exact output/statistics on all 14
+shapes in the current source matrix, but the current Mega MoE parity gate
+remains open: the fresh NVRTC matrix records `dsv3_t1` at 1.011856, and the
+matching `port_t2_h1024_e8_k1` cooldown run at 1.048116. Earlier passing rounds
+do not erase these current misses.
 The other three kernels' compiler-regression matrices also pass both rounds.
 These results require the patched compiler and do not establish parity for
 the unpatched dependency.
@@ -695,11 +695,12 @@ A ratio is TIRx's latency over the origin's, so the bar is a ratio of at most
 ### Mega MoE
 
 The current faithful screen checks all 14 shapes for exact output and
-cumulative-statistics equality. The same-GB200 repeat misses the bar only for
-`dsv3_t1` (1.0444x); the independent B300 first check was 1.0314x. The older
-table below is retained as historical cross-implementation evidence, not as
-validation of the current baseline-faithful port. The commands above regenerate
-raw JSONL outputs locally when a worker is available.
+cumulative-statistics equality. The fresh NVRTC matrix misses the bar for
+`dsv3_t1` at 1.011856; an isolated 31-round run is 1.007077, while the
+`port_t2_h1024_e8_k1` cooldown run is 1.048116. The older table below is
+historical cross-implementation evidence, not validation of a clean current
+baseline-faithful port. The commands above regenerate raw JSONL outputs locally
+when a worker is available.
 
 | Shape | Tokens per rank | Hidden, I | Experts, top-k, shared | DeepGEMM (us) | TIRx (us) | Ratio | Repeat ratio |
 |---|---:|---|---|---:|---:|---:|---:|
