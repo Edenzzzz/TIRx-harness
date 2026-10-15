@@ -602,7 +602,7 @@ def get_kernel(
         bf16_gate = cast_into_bf16_and_pack(gate0, gate1)
         bf16_up = cast_into_bf16_and_pack(up0, up1)
 
-        with txl.If(use_activation_clamp), txl.Then():
+        if use_activation_clamp:
             activation_clamp_value = txl.float32(kernel_activation_clamp)
             clamp_pos = cast_into_bf16_and_pack(activation_clamp_value, activation_clamp_value)
             clamp_neg = cast_into_bf16_and_pack(-activation_clamp_value, -activation_clamp_value)
@@ -615,17 +615,16 @@ def get_kernel(
         gate_y = txl.cuda.float2_y(gate)
         neg_gate_exp = txl.cuda.make_float2(txl.exp(-gate_x), txl.exp(-gate_y))
         denom = txl.cuda.fadd2_rn(txl.cuda.make_float2(txl.float32(1.0), txl.float32(1.0)), neg_gate_exp)
-        with txl.If(kernel_fast_math):
-            with txl.Then():
-                rcp_x = txl.local_scalar("float32")
-                rcp_y = txl.local_scalar("float32")
-                txl.ptx.rcp.approx.ftz.f32(rcp_x, txl.cuda.float2_x(denom))
-                txl.ptx.rcp.approx.ftz.f32(rcp_y, txl.cuda.float2_y(denom))
-                gate = txl.cuda.fmul2_rn(gate, txl.cuda.make_float2(rcp_x, rcp_y))
-            with txl.Else():
-                gate = txl.cuda.make_float2(
-                    gate_x / txl.cuda.float2_x(denom), gate_y / txl.cuda.float2_y(denom)
-                )
+        if kernel_fast_math:
+            rcp_x = txl.local_scalar("float32")
+            rcp_y = txl.local_scalar("float32")
+            txl.ptx.rcp.approx.ftz.f32(rcp_x, txl.cuda.float2_x(denom))
+            txl.ptx.rcp.approx.ftz.f32(rcp_y, txl.cuda.float2_y(denom))
+            gate = txl.cuda.fmul2_rn(gate, txl.cuda.make_float2(rcp_x, rcp_y))
+        else:
+            gate = txl.cuda.make_float2(
+                gate_x / txl.cuda.float2_x(denom), gate_y / txl.cuda.float2_y(denom)
+            )
 
         up = txl.cuda.bfloat1622float2(bf16_up)
         weights = txl.cuda.make_float2(weight0, weight1)

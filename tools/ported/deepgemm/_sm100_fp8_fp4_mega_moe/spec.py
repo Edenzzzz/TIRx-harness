@@ -1346,7 +1346,7 @@ def _compile_tirx_mega_moe_for_config(
     # GPU (currently sm_100a, sm_103a, or sm_107a).
     target = cuda_target()
     mod = tvm.IRModule({"main": kernel})
-    with _cuda_compile_mode(cuda_compile_mode):
+    with target, _cuda_compile_mode(cuda_compile_mode):
         return tvm.compile(mod, target=target, tir_pipeline="tirx")
 
 

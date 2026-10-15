@@ -23,7 +23,7 @@ The current audit found:
 | Two-shot all-reduce | Preserves the baseline's data layout, constexpr loop/rank, and terminal release/relaxed-CAS protocol. All 18 shapes and the independent repeat now pass bitwise equality, independent-reference precision, flag reset, and the unchanged 99% performance gate. |
 | GEMM + all-reduce | Restored baseline waits, elected leaders, and barrier sequence; removed the added exit GPU fence. All 19 shapes, both origins, three matched configurations, and the independent repeat now meet the unchanged precision/performance gate. `sys_fenced` remains a separate semantic example. |
 | All-gather GEMM | `benchmarks.peer.fidelity` restores CUTLASS's per-shard launches, exact auxiliary kernels, and common host schedule. Both 17-shape GPU rounds pass bitwise/reference correctness and the 99% gate at baseline-selected configurations; worst ratios are 1.001948 / 1.002322. The earlier fused/chunked and NumSim copy-warp variants are separate examples, not fidelity evidence. |
-| Mega MoE | Preserves reference timeout, loads, work partition, and synchronization, including mask-guarded combine-load warp barriers. `sys_fenced` stays separate. Generic CUDA loop/coordinate/register lowering and a read-only by-value parameter array restore reference peer-offset access without a port-only shared cache. The current source stamp `979bd32f26952708` produces exact outputs/statistics on all 14 shapes, but the fresh NVRTC matrix still records a `dsv3_t1` ratio of 1.011856; full parity remains open. The [compiler patch, source, tests, and evidence](lowering/README.md) are explicit prerequisites, not evidence for an unpatched compiler. |
+| Mega MoE | Preserves reference timeout, loads, work partition, and synchronization, including mask-guarded combine-load warp barriers. `sys_fenced` stays separate. Generic CUDA loop/coordinate/register lowering and a read-only by-value parameter array restore reference peer-offset access without a port-only shared cache. Source `85c799e75ba5fd87` also restores the reference's compile-time activation branches. The benchmark now shares the actual input/weight/workspace allocations after an allocation-order diagnostic reversed the one-token timing gap. The complete matrix and independent repeat remain required; full parity is not yet established. The [compiler patch, source, tests, and evidence](lowering/README.md) are explicit prerequisites, not evidence for an unpatched compiler. |
 
 Actual CUTLASS and FlashInfer PTX/CUBIN and TIRx CUBIN were captured with the
 existing compiler under the socket lease. The CUTLASS artifact confirms elected
@@ -43,6 +43,16 @@ worst ratios **1.004910 / 1.002717**. No instruction upgrade, alternative
 publication protocol, launch fusion, or port-only retuning closes this gate.
 
 ## Current evidence
+
+The latest Mega MoE correction is described in the
+[activation and allocation audit](lowering/README.md#current-source-and-benchmark-correction).
+Four activation-specialization regressions fail on the old port; 86 focused
+peer numerical/race/sync/fidelity checks pass after the correction. A separate
+43-test run covers benchmark input sharing, provenance eligibility, CPU-only
+compile target preservation, rendezvous handling, and activation fidelity.
+The current source is `85c799e75ba5fd87`; older source stamps and
+separate-allocation results below remain historical evidence, not the current
+shared-input gate. No kernel schedule or benchmark timing threshold changes.
 
 The faithful two-shot all-reduce passes **18 shapes per round**, twice, on
 four socket-leased GPUs with the existing CUDA 13.2.78 toolchain. Worst latency
@@ -144,7 +154,7 @@ lowering; predication, saturation, and other types remain explicit. No
 instruction upgrade, alternate protocol, work repartition, or schedule change
 is used. The final source stamp is `06dfdd4b74d34861`.
 
-The current source stamp `979bd32f26952708` produces exact output and
+The preceding source stamp `979bd32f26952708` produces exact output and
 statistics on all 14 shapes in a fresh four-rank NVRTC matrix. Its ratios are
 within 0.42% on 12 shapes; `dsv3_t1` is **1.011856** and `dsv3_t8192` is
 1.004211, so the matrix does not establish the 99% gate. The result is

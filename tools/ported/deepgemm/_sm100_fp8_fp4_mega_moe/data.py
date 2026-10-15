@@ -542,10 +542,8 @@ def _run_worker(
                         "deadlock the cross-rank kernel collectives"
                     )
 
-            dg_case = None
-            if with_references:
-                dg_case = create_case(deep_gemm, config, group, rank_idx, num_ranks)
             tirx_case = create_case(deep_gemm, config, group, rank_idx, num_ranks)
+            dg_case = tirx_case if with_references else None
             deepgemm_stats = None
             tirx_stats = None
             if timer == "megamoe":
@@ -556,8 +554,6 @@ def _run_worker(
                     deepgemm_stats = initial_stats.clone()
                 tirx_stats = initial_stats.clone()
                 tirx_case.cumulative_local_expert_recv_stats = tirx_stats
-            if dg_case is not None:
-                _copy_inputs_into_symm_buffer(dg_case)
             _copy_inputs_into_symm_buffer(tirx_case)
             y_deepgemm = None
             if with_references:
@@ -678,6 +674,7 @@ def _run_worker(
                 "round_samples": bench_result.get("round_samples", {}),
                 "errors": bench_result["errors"],
                 "timer": bench_result.get("timer"),
+                "input_storage": "shared",
                 "benchmark_protocol": bench_result.get("benchmark_protocol", {}),
             }
             if deepgemm_max_abs_diff is not None:

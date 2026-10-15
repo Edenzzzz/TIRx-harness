@@ -121,7 +121,12 @@ relaxed protocol race-free or simulate the host copy-engine schedule.
 
 `tests/numsim/registry/test_mega_moe_fidelity.py` checks the restored reference
 timeout/load forms, serial chunks within each token's warp, and mask-guarded
-combine-load warp synchronization. The numerical
+combine-load warp synchronization. It also checks that fast-math and clamp
+specializations retain the reference's compile-time branches rather than
+using an expression rebound in an inactive builder branch.
+`tests/test_mega_moe_fidelity.py` checks shared benchmark inputs, target-context
+preservation during CPU-only preparation, and the unchanged precision/parity
+gate. The numerical
 and ordering examples in `tests/numsim/support/peer_mega_moe.py` explicitly use
 `ordering="sys_fenced"`; pass `ordering="origin"` to construct the unstrengthened
 port instead. Neither IR assertions nor the historical strengthened timings
@@ -135,10 +140,13 @@ and passes all 14 shapes in the first GPU matrix, with exact output/statistics
 equality and a worst ratio of 1.0092574x (`dsv3_t1`). The independent repeat's
 one-token result is 1.0106940x, outside the 99% gate; parity remains incomplete.
 The replacement by-value-array port produces exact output/statistics on all 14
-shapes in the current source matrix, but the current Mega MoE parity gate
-remains open: the fresh NVRTC matrix records `dsv3_t1` at 1.011856, and the
+shapes in the preceding source matrix, but that Mega MoE parity gate
+remained open: the fresh NVRTC matrix recorded `dsv3_t1` at 1.011856, and the
 matching `port_t2_h1024_e8_k1` cooldown run at 1.048116. Earlier passing rounds
-do not erase these current misses.
+do not erase those misses. The [current correction](lowering/README.md#current-source-and-benchmark-correction)
+restores the reference activation branch and removes the benchmark's
+separate-input allocation bias; its complete matrix and repeat are required
+before claiming full parity.
 The other three kernels' compiler-regression matrices also pass both rounds.
 These results require the patched compiler and do not establish parity for
 the unpatched dependency.
@@ -616,6 +624,10 @@ nvidia-cutlass-dsl 4.7.0.
   the slowest rank's, and the reported time is the median over rounds.
 - **Correctness:** checked on every benchmarked shape before timing. The
   output and the cumulative statistics must equal DeepGEMM's exactly.
+- **Storage:** both implementations use the same input, weight, and symmetric
+  workspace allocations, with independent outputs and cumulative statistics.
+  Inputs are restored before each timed launch. Rows record
+  `input_storage="shared"`; the gate rejects missing or distinct-input rows.
 - **Shapes:** DeepGEMM's test default (8192 tokens, hidden 7168,
   intermediate 3072, 384 experts, top-6, one shared expert), the port's own
   matrix at world 4, and the DeepSeek-V3 sweep (hidden 7168, intermediate
@@ -694,12 +706,17 @@ A ratio is TIRx's latency over the origin's, so the bar is a ratio of at most
 
 ### Mega MoE
 
-The current faithful screen checks all 14 shapes for exact output and
+The preceding faithful screen checks all 14 shapes for exact output and
 cumulative-statistics equality. The fresh NVRTC matrix misses the bar for
 `dsv3_t1` at 1.011856; an isolated 31-round run is 1.007077, while the
 `port_t2_h1024_e8_k1` cooldown run is 1.048116. The older table below is
 historical cross-implementation evidence, not validation of a clean current
-baseline-faithful port. The commands above regenerate raw JSONL outputs locally
+baseline-faithful port. Source `85c799e75ba5fd87` restores the activation
+specialization; the current benchmark uses shared input/weight/workspace
+storage, eliminating the allocation assignment difference documented in the
+[lowering audit](lowering/README.md#current-source-and-benchmark-correction).
+Its complete matrix and independent repeat remain separate requirements.
+The commands above regenerate raw JSONL outputs locally
 when a worker is available.
 
 | Shape | Tokens per rank | Hidden, I | Experts, top-k, shared | DeepGEMM (us) | TIRx (us) | Ratio | Repeat ratio |

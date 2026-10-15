@@ -32,9 +32,10 @@ The loop emitter adds this fallback after processing explicit unroll hints:
 }
 ```
 
-The corresponding while lowering is in the same class. It lets CUDA unroll a
-provably small literal upper bound (at most eight iterations) and keeps other
-dynamic trip counts opaque:
+The corresponding while lowering is in the same class. A literal upper
+comparison bound of at most eight receives an unroll-factor hint of eight;
+this is not a proof of the loop's trip count. A scalar-parameter bound receives
+an uncounted hint; other dynamic conditions retain the no-unroll hint:
 
 ```cpp
 void CodeGenCUDA::Dispatch_(const WhileNode* op) {
@@ -325,9 +326,9 @@ Every output and statistic matches exactly. The tiny-shape repeat still
 fails the unchanged 99% gate, so this correction does not close full parity.
 The old misses remain recorded; further lowering investigation is required.
 
-### Current source revalidation
+### Previous source revalidation
 
-The current source stamp `979bd32f26952708` was rebuilt into a fresh cache and
+The preceding source stamp `979bd32f26952708` was rebuilt into a fresh cache and
 run across all 14 declared shapes with the patched generic compiler. Every
 output and cumulative statistic matched bitwise. The ratios were:
 
@@ -361,6 +362,56 @@ loop guard. These paths do not inspect Mega MoE names or shapes. The tiny
 shape's remaining tail is therefore not attributed to extra static SASS; the
 fresh diagnostics require another lowering investigation before claiming
 parity.
+
+### Current source and benchmark correction
+
+Source `85c799e75ba5fd87` restores the reference's compile-time activation
+branches. Python rebinding inside `txl.If`/`txl.Else` had left the final
+activation expression using division even with `fast_math=1`; the emitted
+approximate reciprocals were unused. The port now selects the existing
+reference reciprocal-multiply or division branch at construction time, as
+DeepGEMM's `if constexpr (kFastMath)` does. An infinite activation clamp also
+omits the clamp expressions, matching the reference. This changes no work
+partition, pipeline, launch schedule, or instruction beyond the reference.
+The with-statistics one-token cubin drops from 4208 to 4200 instructions with
+the same compiler; its activation uses the reference's packed multiply.
+
+CPU-only preparation also keeps the selected CUDA target active through the
+compilation callback. An explicit target no longer falls back to querying a
+visible GPU. This does not change the selected target or device instructions.
+
+A four-rank trace of the preceding binary gives mean launch skew of
+1.92–1.98 microseconds for TIRx and 1.89–2.05 for DeepGEMM, but a further
+1.6–1.9 microseconds of completion latency after the last rank starts. Launch
+skew alone therefore does not explain that gap. Fresh compilation confirms
+that those cubins match the earlier prepared libraries byte-for-byte.
+
+The old benchmark creates separate weight and symmetric-workspace allocations
+for the two implementations. Eleven-round diagnostics with the corrected
+activation, unchanged timing protocol, and a four-GPU socket lease give:
+
+| Allocation assignment | TIRx / reference microseconds | Ratio |
+|---|---:|---:|
+| Separate, original assignment | 99.669 / 97.949 | 1.017560 |
+| Separate, swapped assignment | 99.043 / 99.167 | 0.998750 |
+| Shared input/weight/workspace allocations | 99.869 / 99.277 | 1.005963 |
+
+These are diagnostics, not a complete performance gate. The allocation
+crossover shows why numerically identical but separately allocated inputs do
+not isolate lowering overhead. The benchmark now uses the same actual input,
+weight, and symmetric-workspace storage for both implementations; outputs and
+cumulative statistics remain independent. Input restoration, the 8 GB cache
+flush, GPU sleep, stream barrier, alternating order, timing aggregation, and
+`1 / 0.99` threshold are unchanged. Rows record `input_storage="shared"`, and
+the current gate rejects rows without that contract. The full 14-shape matrix
+and independent repeat remain required before claiming parity.
+
+Four activation-specialization controls fail on the old port. The shared-input
+construction control, two metadata controls, and target-context control also
+fail before their respective fixes. The corrected port passes 86 focused
+peer numerical/race/sync/fidelity checks; the benchmark, rendezvous, and
+specialization regression run passes 43 tests. Test commands and complete
+matrix results belong to the validation record, not an inference from SASS.
 
 ### Timeline evidence
 

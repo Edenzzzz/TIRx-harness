@@ -2,6 +2,7 @@
 
 import ast
 import inspect
+from dataclasses import asdict
 
 import pytest
 import tvm
@@ -88,6 +89,22 @@ def test_peer_offsets_are_selected_from_parameters_without_a_shared_cache(emitte
 def test_unknown_ordering_is_rejected():
     with pytest.raises(ValueError, match="unsupported Mega MoE ordering"):
         kernel(ordering="unknown")
+
+
+@pytest.mark.parametrize("fast_math", [0, 1])
+@pytest.mark.parametrize("activation_clamp", [10.0, float("inf")])
+def test_activation_retains_reference_compile_time_branches(fast_math, activation_clamp):
+    shape = Shape(world=1, num_tokens=(4,), hidden=1024, intermediate_hidden=512)
+    configuration = asdict(shape.config())
+    configuration.update(fast_math=fast_math, activation_clamp=activation_clamp)
+    tree = ast.parse(get_kernel(**configuration).script())
+    divisions = [node for node in ast.walk(tree) if isinstance(node, ast.BinOp)
+                 and isinstance(node.op, ast.Div)]
+    reciprocals = calls(tree, "T.ptx.rcp")
+    assert bool(divisions) == (fast_math == 0)
+    assert bool(reciprocals) == (fast_math == 1)
+    clamps = calls(tree, "T.cuda.hmin2") + calls(tree, "T.cuda.hmax2")
+    assert bool(clamps) == (activation_clamp != float("inf"))
 
 
 @pytest.mark.parametrize("world,ordering", [(world, mode) for world in (1, 4)

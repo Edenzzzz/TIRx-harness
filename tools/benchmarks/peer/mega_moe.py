@@ -21,7 +21,9 @@ launch must equal DeepGEMM's bitwise before anything is timed, and then each
 of ``rounds`` rounds times both kernels in one ``deep_gemm.testing.bench_kineto``
 session (the kernel's time from the profiler; the L2 flushed and the ranks
 barriered outside it, with the all-reduce DeepGEMM's test queues behind its
-GPU sleep), alternating their order. A round's time is its slowest
+GPU sleep), alternating their order. Both implementations use the same
+input, weight, and symmetric-workspace allocations; outputs and cumulative
+statistics remain independent. A round's time is its slowest
 rank's; the reported time is the median over rounds (the harness's mean is
 kept as ``*_mean_us``): a process's first round runs on cold clocks and can
 take twice as long, for both kernels alike.
@@ -197,6 +199,7 @@ def compare(shapes: list[str], cache: Path, out: Path, rounds: int) -> None:
         samples = result["round_samples"]
         row = {"shape": name, "run": round(time.time(), 1), "num_sms": num_sms,
                "comparison_kind": "port_fidelity", "ordering": "origin",
+               "input_storage": result["input_storage"],
                "stats_max_abs_diff": correctness["stats_max_abs_diff"],
                "source": built_from,
                "config": {k: v for k, v in shape.items() if k != "name"},
@@ -225,7 +228,8 @@ def validate_rows(rows, shapes, source):
     for shape in shapes:
         row = latest.get(shape)
         ratio = row.get("ratio", math.inf) if row else math.inf
-        if (not row or row.get("max_abs_diff") != 0 or row.get("stats_max_abs_diff") != 0
+        if (not row or row.get("input_storage") != "shared"
+                or row.get("max_abs_diff") != 0 or row.get("stats_max_abs_diff") != 0
                 or not math.isfinite(ratio) or ratio <= 0 or ratio > 1 / 0.99):
             failures.append(shape)
     if not shapes or failures:
