@@ -28,6 +28,21 @@ implicitly unroll dynamic work and duplicate the large two-iteration combine
 body. The unpatched one-token capture was **5944 SASS instructions**, versus
 **5024** for the reference.
 
+**Triggering form.** The port emits ordinary dynamic serial loops and nested
+polling loops like these:
+
+```python
+for index in T.serial(dynamic_count):
+    consume(index)
+
+for index in T.serial(2):
+    while flag[0] < dynamic_count:
+        wait_for_flag(flag)
+```
+
+A literal-looking poll is also not a bounded loop: `while seen[0] < 3` may
+execute arbitrarily many times as the producer progresses.
+
 The compiler code is in `src/backend/cuda/codegen/codegen_cuda.cc`:
 `CodeGenCUDA::Dispatch_(const tirx::ForNode*)` and
 `CodeGenCUDA::BindThreadIndex`. The [complete patch and regression tests](tvm.patch)
@@ -96,6 +111,15 @@ var_idmap_[iv->var.get()] =
     CastFromTo(iv->thread_tag, PrimType::UInt(32), iv->var.ty());
 ```
 
+**Triggering form.** Any IR variable used repeatedly after a thread binding,
+for example:
+
+```python
+thread = T.thread_id([512])
+out[thread] = src[thread] + thread
+aux[thread & 31] = thread
+```
+
 **Fix.** The patched binding emits one local value from the same native special-register
 read and retains its launch-derived range. For example, the 512-thread launch
 emits:
@@ -118,6 +142,14 @@ without changing the native register read or launch geometry.
 **Issue.** Safe same-type local moves remained opaque inline assembly and
 survived into SASS.
 
+**Triggering form.** An unpredicated same-type local copy such as:
+
+```python
+lane = T.thread_id([32])
+value = T.alloc_local((1,), "uint32")
+T.ptx.mov.b32(value[0], source[lane])
+```
+
 **Fix.** In `src/tirx/transform/stmt_simplify.cc`,
 `StmtSimplifier::Mutate_(const EvaluateNode*)` rewrites an unpredicated
 `tirx.ptx.mov` between identical scalar register types into an ordinary local
@@ -134,6 +166,14 @@ one-instruction renderer are unchanged.
 **Issue.** A plain unpredicated `add.u32` on local registers remained opaque
 inline assembly, preventing normal address simplification.
 
+**Triggering form.** Local address arithmetic written as an inline PTX add:
+
+```python
+lane = T.thread_id([32])
+address = T.alloc_local((1,), "uint32")
+T.ptx.add.u32(address[0], source[lane], T.uint32(16))
+```
+
 **Fix.** The same simplifier exposes only that local unsigned-add case to normal
 IR lowering. It preserves 32-bit wraparound and leaves predicated, saturating,
 mixed-type, and other-width forms untouched.
@@ -146,6 +186,19 @@ no instruction contract changes.
 **Issue.** The reference's `layout/sym_buffer.cuh::SymBuffer::map` reads a rank offset
 from its by-value kernel-parameter array. The port instead staged offsets in an
 extra shared-memory cache and exposed scalar parameters, unlike DeepGEMM.
+
+**Triggering form.** The old generated shape looked like flattened scalar
+offsets plus a shared staging table:
+
+```cuda
+extern "C" __global__ void mega_moe_kernel(
+    /* ... */, int64_t symm_rank_offset_0,
+    int64_t symm_rank_offset_1, int64_t symm_rank_offset_2,
+    int64_t symm_rank_offset_3 /* ... */) {
+  __shared__ uint64_t smem_rank_bases[4];
+  smem_rank_bases[lane] = /* select one scalar offset */;
+}
+```
 
 **Fix.** The port declares one 72-element rank-offset array, matching the
 reference rather than requiring a scalar-selection pattern. `ByValueParameterBuffers`
@@ -189,27 +242,55 @@ optimizations.
 
 ### 6. Target preservation
 
-**Issue:** CPU-only preparation could lose the explicitly selected CUDA target
-before the CUDA callback and attempt late GPU detection. **Fix:** enter the
-selected `Target` while calling `tvm.compile`. **Result:** preparation is
-deterministic without changing the target or generated device code.
+**Issue.** CPU-only preparation could lose the explicitly selected CUDA target
+before the CUDA callback and attempt late GPU detection.
+
+**Triggering form:** `tvm.compile(mod, target=target, ...)` invoked the callback
+without an active `Target.current()`, so the callback tried to probe a GPU.
+
+**Fix.** Enter the selected `Target` while calling `tvm.compile`.
+
+**Result.** Preparation is deterministic without changing the target or
+generated device code.
 
 ### 7. Compile-time activation branch
 
-**Issue:** Python rebinding inside `txl.If`/`txl.Else` left the fast-math
+**Issue.** Python rebinding inside `txl.If`/`txl.Else` left the fast-math
 activation expression using division while the emitted approximate reciprocals
-were unused. **Fix:** select the reference branch at construction time.
-**Result:** the corrected with-statistics one-token cubin drops from 4208 to
+were unused.
+
+**Triggering form:** rebinding a Python local inside a builder conditional:
+
+```python
+with txl.If(kernel_fast_math):
+    gate = reciprocal_multiply(gate, denom)
+with txl.Else():
+    gate = divide(gate, denom)
+```
+
+**Fix.** Select the reference branch at construction time.
+
+**Result.** The corrected with-statistics one-token cubin drops from 4208 to
 4200 instructions without changing the schedule or instruction contract.
 
 ### 8. Paired-allocation measurement
 
-**Issue:** separate input/weight/workspace allocations let allocator placement
-dominate the one-token comparison. **Fix:** both implementations use the same
-actual input, weight, and symmetric-workspace allocations; outputs and
-statistics remain independent. **Result:** the timing protocol is now a
-like-for-like lowering comparison, with the original cache flush, sleep,
-barrier, order alternation, and 99% threshold unchanged.
+**Issue.** Separate input/weight/workspace allocations let allocator placement
+dominate the one-token comparison.
+
+**Triggering form:** the old benchmark constructed two independent cases:
+
+```python
+deepgemm_case = create_case(...)
+tirx_case = create_case(...)
+```
+
+**Fix.** Both implementations use the same actual input, weight, and
+symmetric-workspace allocations; outputs and statistics remain independent.
+
+**Result.** The timing protocol is now a like-for-like lowering comparison,
+with the original cache flush, sleep, barrier, order alternation, and 99%
+threshold unchanged.
 
 ## Evidence
 
