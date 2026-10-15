@@ -40,12 +40,20 @@ dynamic trip counts opaque:
 void CodeGenCUDA::Dispatch_(const WhileNode* op) {
   PrintIndent();
   bool small_static_bound = false;
+  bool scalar_parameter_bound = false;
   if (const auto* less = op->condition.as<LTNode>()) {
     PrimExpr simplified = sym::Analyzer()->Simplify(less->b);
     const auto* immediate = simplified.as<IntImmNode>();
     small_static_bound = immediate && immediate->value >= 0 && immediate->value <= 8;
+    PrimExpr bound_expr = less->b;
+    if (const auto* cast = bound_expr.as<CastNode>()) bound_expr = cast->value;
+    if (const auto* variable = bound_expr.as<VarNode>()) {
+      scalar_parameter_bound = scalar_parameter_vars_.count(variable) != 0;
+    }
   }
-  stream << (small_static_bound ? "#pragma unroll 8\n" : "#pragma unroll 1\n");
+  stream << (small_static_bound ? "#pragma unroll 8\n"
+                                : (scalar_parameter_bound ? "#pragma unroll\n"
+                                                            : "#pragma unroll 1\n"));
   PrintIndent();
   stream << "while (1) {\n";
   int while_scope = BeginScope();
@@ -325,9 +333,11 @@ output and cumulative statistic matched bitwise. The ratios were:
 
 The compiler patch now allows bounded literal `while` conditions with an upper
 bound of at most eight to use `#pragma unroll 8`; unbounded and runtime-bound
-loops retain `#pragma unroll 1`. The focused rebuilt-compiler runs pass the two
-previous blocker shapes (`port_t2_h1024_e8_k1` at 1.008 and `dsv3_t1` at
-1.007), while the full matrix is being rerun with the same source stamp.
+loops retain `#pragma unroll 1`. A loop whose upper bound is a scalar kernel
+parameter uses CUDA's uncounted `#pragma unroll`, matching the origin's token
+loop form. The exact rebuilt compiler passes `port_t2_h1024_e8_k1` at 0.991
+in a 31-round run; dsv3 remains state-sensitive and the full matrix is still
+being rerun with the same source stamp.
 
 | Shape group | Result |
 |---|---:|
