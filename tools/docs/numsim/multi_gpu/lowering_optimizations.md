@@ -2,6 +2,27 @@
 
 ## Finding
 
+## Fixed-issue index
+
+This work fixes **eight tracked issues**:
+
+| # | Category | Issue | Fix |
+|---:|---|---|---|
+| 1 | CUDA lowering | Dynamic serial loops and serial loops containing `while` were implicitly unrolled, duplicating loop bodies. | Emit `#pragma unroll 1` unless the IR carries an explicit policy; preserve the origin's uncounted hint only for scalar-parameter token loops. |
+| 2 | CUDA lowering | Execution-coordinate variables expanded to repeated `threadIdx`/`blockIdx`/cluster builtin reads. | Materialize each native coordinate once, reuse the local register, and attach static launch-bound assumptions. |
+| 3 | IR simplification | Safe same-type local `tirx.ptx.mov` operations remained opaque inline assembly. | Rewrite only unpredicated same-type local moves to ordinary local stores. |
+| 4 | IR simplification | Safe local `add.u32` address arithmetic remained opaque inline assembly. | Expose only unpredicated local unsigned addition to normal simplification, preserving wraparound and all other instruction forms. |
+| 5 | Parameter lowering | Peer offsets used extra shared staging/scalar-selection instead of the reference parameter table. | Lower one read-only 72-element `local.param` array to an aligned `__grid_constant__` parameter and add ABI/runtime support. |
+| 6 | Compiler integration | CPU-only preparation could lose the explicitly selected CUDA architecture before the callback. | Keep the selected `Target` active around `tvm.compile`. |
+| 7 | Port fidelity | Python builder rebinding left the fast-math activation expression on the division path while emitting unused reciprocals. | Select the reference's compile-time reciprocal-multiply or division branch directly during kernel construction. |
+| 8 | Measurement validity | Separate allocations made the paired GPU timing depend on which implementation owned the buffers. | Share input, weight, and symmetric-workspace storage while keeping outputs/statistics independent. |
+
+Issues 1–5 are the SASS/lowering fixes. Issues 6–8 make compilation,
+kernel construction, and measurement reflect the baseline; they do not add a
+schedule, instruction, synchronization protocol, or optimization to the port.
+
+## 1. Dynamic-loop unrolling
+
 Two generic CUDA lowering decisions increase generated code: serial loops
 without annotations allow automatic CUDA unrolling, and execution-coordinate
 bindings substitute builtin expressions at every use. CUDA/NVRTC 13.2 duplicates
@@ -62,6 +83,8 @@ void CodeGenCUDA::Dispatch_(const WhileNode* op) {
 }
 ```
 
+## 2. Repeated execution-coordinate reads
+
 The original coordinate binding expands every use to the builtin:
 
 ```cpp
@@ -83,6 +106,8 @@ Bounds come from the corresponding static `thread_extent`, including partial
 CTAs. Dynamic extents receive no assumption. Cluster coordinates retain their
 existing coordinate-versus-linear-rank mapping.
 
+## 3. Opaque scalar moves
+
 The further copy simplification lives in
 `src/tirx/transform/stmt_simplify.cc`,
 `StmtSimplifier::Mutate_(const EvaluateNode*)`. It converts an unpredicated
@@ -92,13 +117,15 @@ Predicated copies, predicate-register moves, mixed-type bit reinterpretations,
 and memory destinations retain their instruction forms. The PTX table and its
 one-instruction renderer are unchanged.
 
+## 4. Opaque local additions
+
 The same simplifier exposes a plain unpredicated `add.u32` on local registers
 as unsigned addition. It preserves 32-bit wraparound and leaves predicated,
 saturating, mixed-type, and other-width forms untouched. This lets the reference's
 ordinary address-plus-16 expression reach normal address lowering instead of
 remaining opaque inline assembly; it does not change the instruction contract.
 
-### By-value parameter buffers
+## 5. Peer-offset parameter storage
 
 The reference's `layout/sym_buffer.cuh::SymBuffer::map` reads a rank offset
 from its by-value kernel-parameter array. The port previously staged the
@@ -135,6 +162,35 @@ ordinary global/shared loads remain forbidden by that contract.
 
 Compiler and runtime must both come from the patched build. This introduces
 no newer CUDA instruction or toolkit requirement than the CUDA 13.2 reference.
+
+## 6–8. Non-lowering parity corrections
+
+These corrections are listed separately so they are not mistaken for kernel
+optimizations.
+
+### 6. Target preservation
+
+**Issue:** CPU-only preparation could lose the explicitly selected CUDA target
+before the CUDA callback and attempt late GPU detection. **Fix:** enter the
+selected `Target` while calling `tvm.compile`. **Result:** preparation is
+deterministic without changing the target or generated device code.
+
+### 7. Compile-time activation branch
+
+**Issue:** Python rebinding inside `txl.If`/`txl.Else` left the fast-math
+activation expression using division while the emitted approximate reciprocals
+were unused. **Fix:** select the reference branch at construction time.
+**Result:** the corrected with-statistics one-token cubin drops from 4208 to
+4200 instructions without changing the schedule or instruction contract.
+
+### 8. Paired-allocation measurement
+
+**Issue:** separate input/weight/workspace allocations let allocator placement
+dominate the one-token comparison. **Fix:** both implementations use the same
+actual input, weight, and symmetric-workspace allocations; outputs and
+statistics remain independent. **Result:** the timing protocol is now a
+like-for-like lowering comparison, with the original cache flush, sleep,
+barrier, order alternation, and 99% threshold unchanged.
 
 ## Evidence
 
@@ -326,11 +382,12 @@ The preceding source stamp `979bd32f26952708` was rebuilt into a fresh cache and
 run across all 14 declared shapes with the patched generic compiler. Every
 output and cumulative statistic matched bitwise. The ratios were:
 
-The preceding prototype allowed literal `while` conditions with an upper
-bound of at most eight to use `#pragma unroll 8`; unbounded and runtime-bound
-loops retain `#pragma unroll 1`. A loop whose upper bound is a scalar kernel
-parameter uses CUDA's uncounted `#pragma unroll`, matching the origin's token
-loop form. The exact rebuilt compiler passes `port_t2_h1024_e8_k1` at 0.991
+The preceding prototype temporarily allowed literal `while` conditions with
+an upper bound of at most eight to use `#pragma unroll 8`; cross-port auditing
+showed that a small flag value is not a bounded trip count. The final compiler
+retains `#pragma unroll 1` for such polls. A loop whose upper bound is a scalar
+kernel parameter uses CUDA's uncounted `#pragma unroll`, matching the origin's
+token-loop form. The exact rebuilt compiler passes `port_t2_h1024_e8_k1` at 0.991
 in a 31-round run and `dsv3_t1` at 1.00984 in an independent 31-round run.
 The full 14-shape matrix has exact outputs/statistics and 13 ratios at or
 below 1.004; its remaining tiny-shape row is 1.011 in that sequence. The
