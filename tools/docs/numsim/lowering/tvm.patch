@@ -1,5 +1,5 @@
 diff --git a/src/backend/cuda/codegen/codegen_cuda.cc b/src/backend/cuda/codegen/codegen_cuda.cc
-index e7a06977c..d1893ffb3 100644
+index e7a06977c..baf61dca7 100644
 --- a/src/backend/cuda/codegen/codegen_cuda.cc
 +++ b/src/backend/cuda/codegen/codegen_cuda.cc
 @@ -192,7 +192,34 @@ void CodeGenCUDA::PrintFunctionSignature(const ffi::String& function_name, const
@@ -36,7 +36,7 @@ index e7a06977c..d1893ffb3 100644
 +    var_idmap_[parameter.get()] = "(" + GetVarID(parameter.get()) + ".values)";
 +  }
  }
-
+ 
  class ThreadIdxExtractor : public tirx::StmtExprVisitor {
 @@ -206,6 +233,7 @@ class ThreadIdxExtractor : public tirx::StmtExprVisitor {
    ffi::Optional<VisitInterrupt> Visit_(const AttrStmtNode* op) final {
@@ -48,7 +48,7 @@ index e7a06977c..d1893ffb3 100644
        }
 @@ -229,6 +257,7 @@ class ThreadIdxExtractor : public tirx::StmtExprVisitor {
    }
-
+ 
   public:
 +  std::unordered_map<std::string, PrimExpr> index_extents;
    PrimExpr threadIdx_x_ext = IntImm::Int32(1);
@@ -73,7 +73,23 @@ index e7a06977c..d1893ffb3 100644
    }
    PrintIndent();
    std::string vid = AllocVarID(op->loop_var.get());
-@@ -399,6 +433,8 @@ void CodeGenCUDA::Dispatch_(const WhileNode* op) {
+@@ -382,8 +416,13 @@ void CodeGenCUDA::Dispatch_(const tirx::ForNode* op) {
+ 
+ void CodeGenCUDA::Dispatch_(const WhileNode* op) {
+   PrintIndent();
+-  // Match CodeGenC: dynamic-trip-count loops must not be unrolled.
+-  stream << "#pragma unroll 1\n";
++  bool small_static_bound = false;
++  if (const auto* less = op->condition.as<LTNode>()) {
++    PrimExpr simplified = sym::Analyzer()->Simplify(less->b);
++    const auto* immediate = simplified.as<IntImmNode>();
++    small_static_bound = immediate && immediate->value >= 0 && immediate->value <= 8;
++  }
++  stream << (small_static_bound ? "#pragma unroll 8\n" : "#pragma unroll 1\n");
+   PrintIndent();
+   stream << "while (1) {\n";
+   int while_scope = BeginScope();
+@@ -399,6 +438,8 @@ void CodeGenCUDA::Dispatch_(const WhileNode* op) {
  void CodeGenCUDA::BindThreadIndex(const IterVar& iv) {
    TVM_FFI_ICHECK(!var_idmap_.count(iv->var.get()));
    const auto& scope = runtime::ThreadScope::Create(iv->thread_tag);
@@ -82,7 +98,7 @@ index e7a06977c..d1893ffb3 100644
    if (scope.IsClusterCtaIdx()) {
      TVM_FFI_ICHECK_GE(scope.dim_index, 0);
      TVM_FFI_ICHECK_LT(scope.dim_index, 3);
-@@ -415,10 +451,36 @@ void CodeGenCUDA::BindThreadIndex(const IterVar& iv) {
+@@ -415,10 +456,36 @@ void CodeGenCUDA::BindThreadIndex(const IterVar& iv) {
                                     ";\" : \"=r\"(ctaid) :);\n"
                                     "  return ctaid;\n"
                                     "}\n");
@@ -118,7 +134,7 @@ index e7a06977c..d1893ffb3 100644
    }
 +  var_idmap_[iv->var.get()] = CastFromTo(cached, PrimType::UInt(32), iv->var.ty());
  }
-
+ 
  void CodeGenCUDA::PrintType(const PrimType& t, std::ostream& os) {  // NOLINT(*)
 diff --git a/src/backend/cuda/codegen/codegen_cuda.h b/src/backend/cuda/codegen/codegen_cuda.h
 index c7703f9e0..1a73b4ff5 100644
@@ -129,7 +145,7 @@ index c7703f9e0..1a73b4ff5 100644
    // y/z cluster-CTA extents are both one.
    bool cluster_cta_x_is_linear_rank_{false};
 +  std::unordered_map<std::string, PrimExpr> thread_index_extents_;
-
+ 
    // Whether the function being generated is a __global__ kernel entry
    // (kDeviceKernelLaunch); __device__ subroutines return real values.
 diff --git a/src/runtime/metadata.h b/src/runtime/metadata.h
@@ -141,9 +157,9 @@ index ce40f8157..64e1acb23 100644
  /*! \brief A tag to launch with CUDA's statically required block dimension */
  constexpr const char* kUseRequiredBlockDimension = "tirx.use_required_block_dimension";
 +constexpr const char* kRequireByValueParameters = "tirx.by_value_parameters_v1";
-
+ 
  }  // namespace launch_param
-
+ 
  /*! \brief Extra tags for function arguments */
 -enum class ArgExtraTags : int { kNone = 0, kTensorMap = 1 };
 +enum class ArgExtraTags : int {
@@ -153,7 +169,7 @@ index ce40f8157..64e1acb23 100644
 +  kScalarGroupMember = 3,
 +  kByValueBuffer = 4
 +};
-
+ 
  /*! \brief function information needed by device */
  class FunctionInfoObj : public ffi::Object {
 diff --git a/src/runtime/pack_args.h b/src/runtime/pack_args.h
@@ -216,15 +232,15 @@ index a12cca310..7aff66571 100644
  #include <tvm/tirx/stmt.h>
 +#include <tvm/tirx/stmt_functor.h>
  #include <tvm/tirx/type.h>
-
+ 
 +#include <map>
  #include <string>
-
+ 
  #include "../runtime/metadata.h"
 @@ -41,6 +45,96 @@
  namespace tvm {
  namespace codegen {
-
+ 
 +struct ByValueParameterBuffer {
 +  PrimType dtype;
 +  int64_t elements;
@@ -317,7 +333,7 @@ index a12cca310..7aff66571 100644
 +
  inline ffi::Map<ffi::String, runtime::FunctionInfo> ExtractFuncInfo(const IRModule& mod) {
    ffi::Map<ffi::String, runtime::FunctionInfo> fmap;
-
+ 
 @@ -70,7 +164,14 @@ inline ffi::Map<ffi::String, runtime::FunctionInfo> ExtractFuncInfo(const IRModu
        arg_extra_tags.push_back(is_tensormap(f->params[i]) ? runtime::ArgExtraTags::kTensorMap
                                                            : runtime::ArgExtraTags::kNone);
@@ -357,7 +373,7 @@ index a496cee1b..e06078c68 100644
      } else {
        PrintType(v->ty, os);
      }
-
+ 
      bool no_alias = func->HasNonzeroAttr(tirx::attr::kNoAlias);
 -    bool is_handle = v->ty.as<PointerTypeNode>();
 +    bool is_handle = v->ty.as<PointerTypeNode>() && !custom_type;
@@ -371,7 +387,7 @@ index fd88f1150..d9aba62fc 100644
 @@ -205,6 +205,61 @@ UnchangedOr<Stmt> StmtSimplifier::Mutate_(const BufferStoreNode* op, InplaceMode
    return store;
  }
-
+ 
 +UnchangedOr<Stmt> StmtSimplifier::Mutate_(const EvaluateNode* op, InplaceMode inplace_mode) {
 +  auto result = Parent::Mutate_(op, inplace_mode);
 +  Stmt statement = std::move(result).ValueOrUnchanged(ffi::GetRef<Stmt>(op));
@@ -435,14 +451,14 @@ index 37694283e..955302431 100644
 --- a/src/tirx/transform/stmt_simplify.h
 +++ b/src/tirx/transform/stmt_simplify.h
 @@ -74,6 +74,8 @@ class StmtSimplifier : public IRMutatorWithAnalyzer {
-
+ 
    UnchangedOr<Stmt> Mutate_(const IfThenElseNode* op, InplaceMode inplace_mode) override;
-
+ 
 +  UnchangedOr<Stmt> Mutate_(const EvaluateNode* op, InplaceMode inplace_mode) override;
 +
    // eliminate useless stores
    UnchangedOr<Stmt> Mutate_(const BufferStoreNode* op, InplaceMode inplace_mode) override;
-
+ 
 diff --git a/src/tirx/transform/tvm_ffi_binder.cc b/src/tirx/transform/tvm_ffi_binder.cc
 index 01fd9b39a..c90deaf93 100644
 --- a/src/tirx/transform/tvm_ffi_binder.cc
@@ -493,14 +509,14 @@ index 01fd9b39a..c90deaf93 100644
 +    BindScalar(device_id, TVMStructGet(PrimType::Int(32), handle, 0, builtin::kDLTensorDeviceId),
                 device_id_path, true);
    }
-
+ 
 diff --git a/tests/python/tirx/codegen/test_codegen_cuda.py b/tests/python/tirx/codegen/test_codegen_cuda.py
-index 04e872c83..2cadeb1a8 100644
+index 04e872c83..4cad79995 100644
 --- a/tests/python/tirx/codegen/test_codegen_cuda.py
 +++ b/tests/python/tirx/codegen/test_codegen_cuda.py
 @@ -364,9 +364,7 @@ def test_tirx_cuda_kernel_return_zero_codegen_is_void_early_return():
              A[bx] = A[bx] + 1
-
+ 
      src, _ = _get_source(main)
 -    # The bounded blockIdx.x domain simplifies ``blockIdx.x >= 3`` to the
 -    # equivalent final-point predicate, including CUDA's explicit index cast.
@@ -508,11 +524,11 @@ index 04e872c83..2cadeb1a8 100644
 +    assert re.search(r"if \(\(\(int\)__tirx_cached_ctaid_x\) == 3\)", src)
      assert "return;" in src
      assert "return 0;" not in src
-
-@@ -416,6 +414,241 @@ def test_serial_disable_unroll_pragma_immediately_precedes_dynamic_for():
+ 
+@@ -416,6 +414,253 @@ def test_serial_disable_unroll_pragma_immediately_precedes_dynamic_for():
      assert re.search(r"#pragma unroll 1\s*for \(", src)
-
-
+ 
+ 
 +@pytest.mark.parametrize("unroll_hint", [None, True, 2, False])
 +def test_serial_dynamic_loop_preserves_explicit_unroll_policy(unroll_hint):
 +    @T.prim_func
@@ -539,6 +555,18 @@ index 04e872c83..2cadeb1a8 100644
 +
 +    src, _ = _get_source(main)
 +    assert re.search(r"#pragma unroll 1\s*for \(", src)
++
++
++def test_small_static_while_uses_bounded_unroll():
++    @T.prim_func
++    def main(A: T.Buffer((32,), "int32")):
++        T.device_entry()
++        tx = T.thread_id([32])
++        while A[tx] < 4:
++            A[tx] = A[tx] + 1
++
++    src, _ = _get_source(main)
++    assert re.search(r"#pragma unroll 8\s*while \(1\)", src)
 +
 +
 +def test_small_static_serial_loop_retains_cuda_compiler_unroll_choice():
@@ -751,10 +779,10 @@ index 04e872c83..2cadeb1a8 100644
  def test_cluster_cta_id_codegen_uses_coordinate_sregs():
      @T.prim_func
      def main(A: T.Buffer((1,), "int32")):
-@@ -432,6 +665,107 @@ def test_cluster_cta_id_codegen_uses_coordinate_sregs():
+@@ -432,6 +677,107 @@ def test_cluster_cta_id_codegen_uses_coordinate_sregs():
      assert "cooperative_groups::cluster_group::block_index" not in src
-
-
+ 
+ 
 +def _by_value_array(dtype, elements):
 +    return tvm.script.from_source(
 +        f'''
@@ -864,7 +892,7 @@ index 9db466618..bc969ab23 100644
 --- a/tests/python/tirx/codegen/test_ptx_dialect.py
 +++ b/tests/python/tirx/codegen/test_ptx_dialect.py
 @@ -1988,7 +1988,6 @@ def test_ptx_data_movement_dispatch():
-
+ 
      src = _cuda_source(kernel)
      for text in (
 -        "mov.b32 %0, %1;",
