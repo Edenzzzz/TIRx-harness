@@ -23,7 +23,7 @@ The current audit found:
 | Two-shot all-reduce | Preserves the baseline's data layout, constexpr loop/rank, and terminal release/relaxed-CAS protocol. All 18 shapes and the independent repeat now pass bitwise equality, independent-reference precision, flag reset, and the unchanged 99% performance gate. |
 | GEMM + all-reduce | Restored baseline waits, elected leaders, and barrier sequence; removed the added exit GPU fence. All 19 shapes, both origins, three matched configurations, and the independent repeat now meet the unchanged precision/performance gate. `sys_fenced` remains a separate semantic example. |
 | All-gather GEMM | `benchmarks.peer.fidelity` restores CUTLASS's per-shard launches, exact auxiliary kernels, and common host schedule. Both 17-shape GPU rounds pass bitwise/reference correctness and the 99% gate at baseline-selected configurations; worst ratios are 1.001948 / 1.002322. The earlier fused/chunked and NumSim copy-warp variants are separate examples, not fidelity evidence. |
-| Mega MoE | Preserves reference timeout, loads, work partition, synchronization, and compile-time activation branches. `sys_fenced` stays separate. Source `85c799e75ba5fd87`, with the final generic compiler patch and shared benchmark inputs, passes all 14 shapes and the independent repeat: worst ratios 1.004591 / 1.006576. Both statistics specializations match every BF16 output bit on all four ranks. The [compiler patch, source, tests, and evidence](lowering/README.md) are explicit prerequisites, not evidence for an unpatched compiler. |
+| Mega MoE | Preserves reference timeout, loads, work partition, synchronization, and compile-time activation branches. `sys_fenced` stays separate. Source `85c799e75ba5fd87`, with the final generic compiler patch and shared benchmark inputs, passes all 14 shapes and the independent repeat: worst ratios 1.004591 / 1.006576. Both statistics specializations match every BF16 output bit on all four ranks. The [compiler patch, source, tests, and evidence](lowering_optimizations.md) are explicit prerequisites, not evidence for an unpatched compiler. |
 
 Actual CUTLASS and FlashInfer PTX/CUBIN and TIRx CUBIN were captured with the
 existing compiler under the socket lease. The CUTLASS artifact confirms elected
@@ -45,7 +45,7 @@ publication protocol, launch fusion, or port-only retuning closes this gate.
 ## Current evidence
 
 The latest Mega MoE correction is described in the
-[activation and allocation audit](lowering/README.md#current-source-and-benchmark-correction).
+[activation and allocation audit](lowering_optimizations.md#current-source-and-benchmark-correction).
 Four activation-specialization regressions fail on the old port; 86 focused
 peer numerical/race/sync/fidelity checks pass after the correction. A separate
 43-test run covers benchmark input sharing, provenance eligibility, CPU-only
@@ -286,7 +286,7 @@ Source `979bd32f26952708` passes 82 focused checks and two one-token GPU
 comparisons at 1.0000308 / 1.0032366, with exact output/statistics. The tiny
 case passes first at 0.9891977 but misses its repeat at **1.0256084**
 (33.001/32.177 microseconds). That stage did not establish full parity. The
-[lowering evidence](lowering/README.md#restoring-reference-shared-address-forms)
+[lowering evidence](lowering_optimizations.md#restoring-reference-shared-address-forms)
 records the exact reference, disassembly delta, and all four comparisons.
 
 After the ABI update, **138 additional targeted tests pass** for the complete

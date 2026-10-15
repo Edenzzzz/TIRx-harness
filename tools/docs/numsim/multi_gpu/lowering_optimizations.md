@@ -244,7 +244,7 @@ The stack build's first tiny `port_t2_h1024_e8_k1` result is
 misses the gate; passing one-token diagnostics do not close full parity.
 The other three distributed kernels' independent compiler-regression rounds
 are complete and pass on every retained configuration, as recorded in the
-[validation audit](../MULTI_GPU_VALIDATION.md#current-evidence).
+[validation audit](MULTI_GPU_VALIDATION.md#current-evidence).
 
 The replacement by-value-array implementation removes the scalar-group
 experiment entirely. Its first prototype one-token comparison is
@@ -399,7 +399,7 @@ flush, GPU sleep, stream barrier, alternating order, timing aggregation, and
 `1 / 0.99` threshold are unchanged. Rows record `input_storage="shared"`, and
 the current gate rejects rows without that contract. The full 14-shape matrix
 and independent repeat now pass, with worst ratios **1.004591 / 1.006576**.
-The [final latency table and validation scope](../MULTI_GPU_VALIDATION.md#final-mega-moe-matrix)
+The [final latency table and validation scope](MULTI_GPU_VALIDATION.md#final-mega-moe-matrix)
 record each shape, the rebuilt compiler, and separate bit-level checks of both
 statistics specializations.
 
@@ -525,7 +525,7 @@ submodules, and build using TVM's normal build instructions. Use that build's
 matching Python sources and libraries for validation, for example:
 
 ```bash
-git -C /path/to/tvm apply /path/to/TIRx-harness/tools/docs/numsim/lowering/tvm.patch
+git -C /path/to/tvm apply /path/to/TIRx-harness/tools/docs/numsim/multi_gpu/tvm.patch
 cmake --build /path/to/tvm/build --parallel 8
 export TVM_LIBRARY_PATH=/path/to/tvm/build/lib
 export PYTHONPATH=/path/to/tvm/python:/path/to/TIRx-harness/tools

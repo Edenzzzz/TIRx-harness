@@ -135,7 +135,7 @@ establish current Mega MoE GPU parity.
 The unpatched compiler missed the one-token GPU gate at 1.0444x. Its cubin
 contains 5944 instructions versus the reference's 5024, counting predicated
 instructions (the earlier 31% count was incomplete). The rebuilt generic
-[loop and coordinate lowering](lowering/README.md) reduces the count to 4104
+[loop and coordinate lowering](lowering_optimizations.md) reduces the count to 4104
 and passes all 14 shapes in the first GPU matrix, with exact output/statistics
 equality and a worst ratio of 1.0092574x (`dsv3_t1`). The independent repeat's
 one-token result is 1.0106940x, outside the 99% gate; parity was incomplete at that stage.
@@ -143,7 +143,7 @@ The replacement by-value-array port produces exact output/statistics on all 14
 shapes in the preceding source matrix, but that Mega MoE parity gate
 remained open: the fresh NVRTC matrix recorded `dsv3_t1` at 1.011856, and the
 matching `port_t2_h1024_e8_k1` cooldown run at 1.048116. Earlier passing rounds
-do not erase those misses. The [current correction](lowering/README.md#current-source-and-benchmark-correction)
+do not erase those misses. The [current correction](lowering_optimizations.md#current-source-and-benchmark-correction)
 restores the reference activation branch and removes the benchmark's
 separate-input allocation bias. Its complete matrix and repeat now pass,
 with worst ratios 1.004591 / 1.006576; the
@@ -720,7 +720,7 @@ implementations; output/statistics storage remains independent, and the
 timing protocol and 99% threshold are unchanged.
 
 Earlier separate-allocation misses (including 1.011856 and 1.048116) remain
-documented in the [lowering audit](lowering/README.md#previous-source-revalidation).
+documented in the [lowering audit](lowering_optimizations.md#previous-source-revalidation).
 The older table below is historical cross-implementation evidence, not the
 current baseline-faithful gate. The commands above regenerate raw JSONL outputs locally
 when a worker is available.

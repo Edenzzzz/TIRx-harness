@@ -35,9 +35,9 @@ The check still covers the paths selected by those concrete inputs.
 The feature guides put semantics, passing forms, counterexamples, and their
 tests before implementation details and benchmark results:
 
-- {repo}`Multimem/NVLS rules and tests <tools/docs/numsim/MULTI_GPU_MULTIMEM.md>`
-- {repo}`Peer-memory rules and tests <tools/docs/numsim/MULTI_GPU_PEER.md>`
-- {repo}`Draft validation status and remaining gates <tools/docs/numsim/MULTI_GPU_VALIDATION.md>`
+- {repo}`Multimem/NVLS rules and tests <tools/docs/numsim/multi_gpu/MULTI_GPU_MULTIMEM.md>`
+- {repo}`Peer-memory rules and tests <tools/docs/numsim/multi_gpu/MULTI_GPU_PEER.md>`
+- {repo}`Draft validation status and remaining gates <tools/docs/numsim/multi_gpu/MULTI_GPU_VALIDATION.md>`
 
 The complete `MulticastWindow` and `SymmetricBuffer` input constructions are
 in the {doc}`multi-GPU input examples <api/inputs>`. In both cases, construct

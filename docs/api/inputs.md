@@ -94,8 +94,8 @@ rank2_out = sim.outputs[numsim.rank_binding_name("out", 2)]
 The same `inputs` list is used for NumSim and both checkers. These are CPU
 preflight runs; a separate GPU launch is needed for hardware parity and timing.
 
-The {repo}`multimem guide <tools/docs/numsim/MULTI_GPU_MULTIMEM.md>` and
-{repo}`peer-memory guide <tools/docs/numsim/MULTI_GPU_PEER.md>` document the
+The {repo}`multimem guide <tools/docs/numsim/multi_gpu/MULTI_GPU_MULTIMEM.md>` and
+{repo}`peer-memory guide <tools/docs/numsim/multi_gpu/MULTI_GPU_PEER.md>` document the
 binding restrictions, memory-ordering rules, and related tests.
 
 ## Reusable cases and comparisons

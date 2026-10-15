@@ -3,7 +3,7 @@ descriptor.
 
 On sm_100 a global load or store names a 64-bit memory descriptor held in a
 uniform register pair, ``desc[URn]``. NVRTC 13.0 can leave one half of the
-pair unwritten (docs/numsim/MULTI_GPU_PEER.md); the access then uses whatever
+pair unwritten (docs/numsim/multi_gpu/MULTI_GPU_PEER.md); the access then uses whatever
 an earlier kernel left in that register. This flags every access whose pair
 has a half that no earlier instruction of the function writes. "Earlier" is
 program order, not control flow, so a clean scan is evidence, not proof.
