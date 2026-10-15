@@ -28,20 +28,47 @@ implicitly unroll dynamic work and duplicate the large two-iteration combine
 body. The unpatched one-token capture was **5944 SASS instructions**, versus
 **5024** for the reference.
 
-**Triggering form.** The port emits ordinary dynamic serial loops and nested
-polling loops like these:
+**Triggering form.** This is a real dynamic-loop site in
+`tools/ported/cutlass/sm100_all_gather_gemm.py:602-619`:
 
 ```python
-for index in T.serial(dynamic_count):
-    consume(index)
-
-for index in T.serial(2):
-    while flag[0] < dynamic_count:
-        wait_for_flag(flag)
+item = txl.local_scalar("int32", init=cta_linear)
+byte = txl.local_scalar("int32")
+words = txl.alloc_local((4,), "uint32")
+with txl.While(item < (world - 1) * p.chunks):
+    chunk = item % p.chunks
+    txl.assign(byte, thread * 16)
+    with txl.While(byte < chunk_bytes):
+        txl.ptx.ld.global_.v4.b32(*[words[i] for i in range(4)], ...)
+        txl.ptx.st.global_.v4.b32(..., *[words[i] for i in range(4)])
+        txl.assign(byte, byte + threads * 16)
+    txl.assign(item, item + cm * cn * p.clusters)
 ```
 
-A literal-looking poll is also not a bounded loop: `while seen[0] < 3` may
-execute arbitrarily many times as the producer progresses.
+The same file has a dynamic work loop containing a nested tile loop at
+`tools/ported/cutlass/sm100_all_gather_gemm.py:629-655`:
+
+```python
+work = txl.local_scalar("int32", init=first_work)
+count = txl.local_scalar("int32")
+with txl.If(_elected()), txl.Then():
+    with txl.While(work < p.cluster_work):
+        txl.assign(count, 0)
+        with txl.While(count < p.k_tiles):
+            _wait_unless(ab_pipe.empty.ptr_to([state.stage]), state.phase, ready)
+            ...
+            txl.assign(count, count + 1)
+        txl.assign(work, work + 1)
+```
+
+Issue 1 does **not** fully unroll every loop. Explicit `txl.unroll` loops and
+ordinary small static serial loops keep their existing policy. The regression
+is specifically for serial loops with no explicit policy when the extent is
+dynamic or the body contains a `while`; a literal-looking poll is still
+unbounded, as shown by the `while seen[0] < 3` regression in `tvm.patch`. For
+comparison, the same port's static reset loops at
+`tools/ported/cutlass/sm100_all_gather_gemm.py:290-295` remain ordinary
+`T.serial(world)` loops; they are not forced through the dynamic-loop fallback.
 
 The compiler code is in `src/backend/cuda/codegen/codegen_cuda.cc`:
 `CodeGenCUDA::Dispatch_(const tirx::ForNode*)` and
@@ -111,13 +138,18 @@ var_idmap_[iv->var.get()] =
     CastFromTo(iv->thread_tag, PrimType::UInt(32), iv->var.ty());
 ```
 
-**Triggering form.** Any IR variable used repeatedly after a thread binding,
-for example:
+**Triggering form.** The all-gather port binds several execution coordinates
+once in `tools/ported/cutlass/sm100_all_gather_gemm.py:473-485`, then reuses them
+throughout the copy, TMA, and MMA paths:
 
 ```python
-thread = T.thread_id([512])
-out[thread] = src[thread] + thread
-aux[thread & 31] = thread
+block_x, block_y, first_work = txl.cta_id()
+cta_linear = block_x + block_y * cm + first_work * (cm * cn)
+cluster_rank = txl.local_scalar("int32", init=txl.cuda.mov_sreg(32, "cluster_ctarank"))
+cluster_x = txl.local_scalar("int32", init=cluster_rank % cm)
+cluster_y = txl.local_scalar("int32", init=cluster_rank // cm)
+warp = txl.warp_id()
+lane = txl.lane_id()
 ```
 
 **Fix.** The patched binding emits one local value from the same native special-register
@@ -142,12 +174,14 @@ without changing the native register read or launch geometry.
 **Issue.** Safe same-type local moves remained opaque inline assembly and
 survived into SASS.
 
-**Triggering form.** An unpredicated same-type local copy such as:
+**Triggering form.** The Mega MoE port contains the real same-type local PTX
+copies in `tools/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:487-490`:
 
 ```python
-lane = T.thread_id([32])
-value = T.alloc_local((1,), "uint32")
-T.ptx.mov.b32(value[0], source[lane])
+txl.ptx.mov.b32(scaled_values[0], txl.cuda.float2_x(scaled_pair[0]))
+txl.ptx.mov.b32(scaled_values[1], txl.cuda.float2_y(scaled_pair[0]))
+with txl.unroll(0, 2) as dim:
+    txl.ptx.mov.b32(scaled_bits[dim], float_bits(scaled_values[dim]))
 ```
 
 **Fix.** In `src/tirx/transform/stmt_simplify.cc`,
@@ -166,12 +200,16 @@ one-instruction renderer are unchanged.
 **Issue.** A plain unpredicated `add.u32` on local registers remained opaque
 inline assembly, preventing normal address simplification.
 
-**Triggering form.** Local address arithmetic written as an inline PTX add:
+**Triggering form.** The real local address arithmetic is in
+`tools/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:316-328`:
 
 ```python
-lane = T.thread_id([32])
-address = T.alloc_local((1,), "uint32")
-T.ptx.add.u32(address[0], source[lane], T.uint32(16))
+mapped_dst_hi = txl.local_scalar("uint32")
+txl.ptx.add.u32(mapped_dst_hi, mapped_dst, txl.uint32(16))
+return txl.ptx.st_async.shared__cluster.mbarrier__complete_tx__bytes.v4.u32(
+    mapped_dst_hi, task_info_regs[4], task_info_regs[5],
+    task_info_regs[6], task_info_regs[7], mapped_bar
+)
 ```
 
 **Fix.** The same simplifier exposes only that local unsigned-add case to normal
@@ -187,18 +225,30 @@ no instruction contract changes.
 from its by-value kernel-parameter array. The port instead staged offsets in an
 extra shared-memory cache and exposed scalar parameters, unlike DeepGEMM.
 
-**Triggering form.** The old generated shape looked like flattened scalar
-offsets plus a shared staging table:
+**Triggering form.** The corrected source uses the actual by-value array in
+`tools/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:697-707` and declares
+it at `tools/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:857-862`:
 
 ```cuda
-extern "C" __global__ void mega_moe_kernel(
-    /* ... */, int64_t symm_rank_offset_0,
-    int64_t symm_rank_offset_1, int64_t symm_rank_offset_2,
-    int64_t symm_rank_offset_3 /* ... */) {
-  __shared__ uint64_t smem_rank_bases[4];
-  smem_rank_bases[lane] = /* select one scalar offset */;
-}
+def symm_rank_offset_arg_expr(symm_rank_offsets, mapped_rank_idx):
+    if num_processes == 1:
+        return txl.int64(0)
+    return symm_rank_offsets[txl.cast(mapped_rank_idx, "int32")]
+
+def load_symm_rank_base(dst, sym_buffer_base, symm_rank_offsets, mapped_rank_idx):
+    return txl.assign(
+        dst,
+        sym_buffer_base
+        + txl.cast(symm_rank_offset_arg_expr(symm_rank_offsets, mapped_rank_idx), "uint64"),
+    )
+
+def mega_moe(..., symm_rank_offsets: txl.gptr[txl.i64, (72,)], ...):
+    ...
 ```
+
+Before the fix, the generated CUDA had flattened scalar offsets and a shared
+selection cache; the source site above is the real trigger/fix point that now
+preserves the reference parameter-table shape.
 
 **Fix.** The port declares one 72-element rank-offset array, matching the
 reference rather than requiring a scalar-selection pattern. `ByValueParameterBuffers`
@@ -245,8 +295,18 @@ optimizations.
 **Issue.** CPU-only preparation could lose the explicitly selected CUDA target
 before the CUDA callback and attempt late GPU detection.
 
-**Triggering form:** `tvm.compile(mod, target=target, ...)` invoked the callback
-without an active `Target.current()`, so the callback tried to probe a GPU.
+**Triggering form:** `tools/ported/deepgemm/_sm100_fp8_fp4_mega_moe/spec.py:1347-1350`
+compiled with an explicitly selected target after CPU-only preparation:
+
+```python
+target = cuda_target()
+mod = tvm.IRModule({"main": kernel})
+with target, _cuda_compile_mode(cuda_compile_mode):
+    return tvm.compile(mod, target=target, tir_pipeline="tirx")
+```
+
+Without the `with target` scope, the callback saw no active
+`Target.current()` and tried to probe a GPU.
 
 **Fix.** Enter the selected `Target` while calling `tvm.compile`.
 
@@ -259,13 +319,20 @@ generated device code.
 activation expression using division while the emitted approximate reciprocals
 were unused.
 
-**Triggering form:** rebinding a Python local inside a builder conditional:
+**Triggering form:** the real activation branch is in
+`tools/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:605-627`:
 
 ```python
-with txl.If(kernel_fast_math):
-    gate = reciprocal_multiply(gate, denom)
-with txl.Else():
-    gate = divide(gate, denom)
+if kernel_fast_math:
+    rcp_x = txl.local_scalar("float32")
+    rcp_y = txl.local_scalar("float32")
+    txl.ptx.rcp.approx.ftz.f32(rcp_x, txl.cuda.float2_x(denom))
+    txl.ptx.rcp.approx.ftz.f32(rcp_y, txl.cuda.float2_y(denom))
+    gate = txl.cuda.fmul2_rn(gate, txl.cuda.make_float2(rcp_x, rcp_y))
+else:
+    gate = txl.cuda.make_float2(
+        gate_x / txl.cuda.float2_x(denom), gate_y / txl.cuda.float2_y(denom)
+    )
 ```
 
 **Fix.** Select the reference branch at construction time.
@@ -278,12 +345,19 @@ with txl.Else():
 **Issue.** Separate input/weight/workspace allocations let allocator placement
 dominate the one-token comparison.
 
-**Triggering form:** the old benchmark constructed two independent cases:
+**Triggering form:** the paired benchmark now constructs one shared case at
+`tools/ported/deepgemm/_sm100_fp8_fp4_mega_moe/data.py:545-557`:
 
 ```python
-deepgemm_case = create_case(...)
-tirx_case = create_case(...)
+tirx_case = create_case(deep_gemm, config, group, rank_idx, num_ranks)
+dg_case = tirx_case if with_references else None
+...
+tirx_case.cumulative_local_expert_recv_stats = tirx_stats
+_copy_inputs_into_symm_buffer(tirx_case)
 ```
+
+The old trigger was two independent `create_case(...)` calls, which gave the
+allocator different input, weight, and workspace placements.
 
 **Fix.** Both implementations use the same actual input, weight, and
 symmetric-workspace allocations; outputs and statistics remain independent.
