@@ -23,17 +23,18 @@ schedule, instruction, synchronization protocol, or optimization to the port.
 
 ## 1. Dynamic-loop unrolling
 
-Two generic CUDA lowering decisions increase generated code: serial loops
-without annotations allow automatic CUDA unrolling, and execution-coordinate
-bindings substitute builtin expressions at every use. CUDA/NVRTC 13.2 duplicates
-the large two-iteration combine loop, partially unrolls dynamic loops, and
-repeatedly reads execution coordinates in the faithful Mega MoE port.
+**Issue.** Serial loops without annotations allowed CUDA/NVRTC 13.2 to
+implicitly unroll dynamic work and duplicate the large two-iteration combine
+body. The unpatched one-token capture was **5944 SASS instructions**, versus
+**5024** for the reference.
 
 The compiler code is in `src/backend/cuda/codegen/codegen_cuda.cc`:
 `CodeGenCUDA::Dispatch_(const tirx::ForNode*)` and
 `CodeGenCUDA::BindThreadIndex`. The [complete patch and regression tests](tvm.patch)
 target TVM commit
 `ea0cfa320fcdea0567e2f4c19d363625c66630d1`.
+
+**Fix.**
 
 The proposed generic lowering preserves explicit unroll hints, leaves small
 static serial loops to the CUDA compiler, and emits `#pragma unroll 1` for an
@@ -83,16 +84,19 @@ void CodeGenCUDA::Dispatch_(const WhileNode* op) {
 }
 ```
 
+**Result.** The generic loop policy reduced the capture to 4264 instructions;
+coordinate caching and later simplifications are measured separately below.
+
 ## 2. Repeated execution-coordinate reads
 
-The original coordinate binding expands every use to the builtin:
+**Issue.** The original coordinate binding expands every use to the builtin:
 
 ```cpp
 var_idmap_[iv->var.get()] =
     CastFromTo(iv->thread_tag, PrimType::UInt(32), iv->var.ty());
 ```
 
-The patched binding emits one local value from the same native special-register
+**Fix.** The patched binding emits one local value from the same native special-register
 read and retains its launch-derived range. For example, the 512-thread launch
 emits:
 
@@ -106,38 +110,49 @@ Bounds come from the corresponding static `thread_extent`, including partial
 CTAs. Dynamic extents receive no assumption. Cluster coordinates retain their
 existing coordinate-versus-linear-rank mapping.
 
+**Result.** Coordinate caching removes repeated special-register materialization
+without changing the native register read or launch geometry.
+
 ## 3. Opaque scalar moves
 
-The further copy simplification lives in
-`src/tirx/transform/stmt_simplify.cc`,
-`StmtSimplifier::Mutate_(const EvaluateNode*)`. It converts an unpredicated
+**Issue.** Safe same-type local moves remained opaque inline assembly and
+survived into SASS.
+
+**Fix.** In `src/tirx/transform/stmt_simplify.cc`,
+`StmtSimplifier::Mutate_(const EvaluateNode*)` rewrites an unpredicated
 `tirx.ptx.mov` between identical scalar register types into an ordinary local
 `BufferStore`, allowing normal value simplification and CUDA optimization.
 Predicated copies, predicate-register moves, mixed-type bit reinterpretations,
 and memory destinations retain their instruction forms. The PTX table and its
 one-instruction renderer are unchanged.
 
+**Result.** The scalar-copy stage reduced the measured capture from 4104 to
+4096 instructions without changing the instruction contract.
+
 ## 4. Opaque local additions
 
-The same simplifier exposes a plain unpredicated `add.u32` on local registers
-as unsigned addition. It preserves 32-bit wraparound and leaves predicated,
-saturating, mixed-type, and other-width forms untouched. This lets the reference's
-ordinary address-plus-16 expression reach normal address lowering instead of
-remaining opaque inline assembly; it does not change the instruction contract.
+**Issue.** A plain unpredicated `add.u32` on local registers remained opaque
+inline assembly, preventing normal address simplification.
+
+**Fix.** The same simplifier exposes only that local unsigned-add case to normal
+IR lowering. It preserves 32-bit wraparound and leaves predicated, saturating,
+mixed-type, and other-width forms untouched.
+
+**Result.** Ordinary address-plus-16 expressions simplify like the reference;
+no instruction contract changes.
 
 ## 5. Peer-offset parameter storage
 
-The reference's `layout/sym_buffer.cuh::SymBuffer::map` reads a rank offset
-from its by-value kernel-parameter array. The port previously staged the
-offsets into an extra shared-memory cache. That staging is not present in
-DeepGEMM and is removed. The port now declares one 72-element rank-offset
-array, matching the reference rather than exposing 72 scalar parameters or
-requiring a scalar-selection pattern to be recognized.
+**Issue.** The reference's `layout/sym_buffer.cuh::SymBuffer::map` reads a rank offset
+from its by-value kernel-parameter array. The port instead staged offsets in an
+extra shared-memory cache and exposed scalar parameters, unlike DeepGEMM.
 
-`ByValueParameterBuffers` in `src/target/build_common.h` recognizes fixed,
-flat, read-only `local.param` buffers. CUDA codegen emits a naturally aligned
-`const __grid_constant__` array struct; normal indexed reads lower to the
-reference's constant-parameter loads. The host binder requires a CPU tensor
+**Fix.** The port declares one 72-element rank-offset array, matching the
+reference rather than requiring a scalar-selection pattern. `ByValueParameterBuffers`
+in `src/target/build_common.h` recognizes
+fixed, flat, read-only `local.param` buffers. CUDA codegen emits a naturally
+aligned `const __grid_constant__` array struct; normal indexed reads lower to
+the reference's constant-parameter loads. The host binder requires a CPU tensor
 with the declared dtype, shape, and contiguous layout. Stores and escaped
 parameter addresses are rejected. Supported elements are scalar signed and
 unsigned 32-/64-bit integers and 32-/64-bit floats, with 1–1024 elements.
@@ -159,6 +174,10 @@ then snapshots those arrays independently of aliased caller buffers for every
 rank. Numerical execution, Racecheck, and Synccheck use the same snapshots.
 The final low-level IR contract runs after declaring the parameter scope;
 ordinary global/shared loads remain forbidden by that contract.
+
+**Result.** The parameter-table stage measured 4080 instructions, removed the
+port-only shared cache, and preserved the same high-level Python call and
+NumSim/checker semantics.
 
 Compiler and runtime must both come from the patched build. This introduces
 no newer CUDA instruction or toolkit requirement than the CUDA 13.2 reference.
