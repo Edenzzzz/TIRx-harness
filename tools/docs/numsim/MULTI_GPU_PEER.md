@@ -138,15 +138,17 @@ instructions (the earlier 31% count was incomplete). The rebuilt generic
 [loop and coordinate lowering](lowering/README.md) reduces the count to 4104
 and passes all 14 shapes in the first GPU matrix, with exact output/statistics
 equality and a worst ratio of 1.0092574x (`dsv3_t1`). The independent repeat's
-one-token result is 1.0106940x, outside the 99% gate; parity remains incomplete.
+one-token result is 1.0106940x, outside the 99% gate; parity was incomplete at that stage.
 The replacement by-value-array port produces exact output/statistics on all 14
 shapes in the preceding source matrix, but that Mega MoE parity gate
 remained open: the fresh NVRTC matrix recorded `dsv3_t1` at 1.011856, and the
 matching `port_t2_h1024_e8_k1` cooldown run at 1.048116. Earlier passing rounds
 do not erase those misses. The [current correction](lowering/README.md#current-source-and-benchmark-correction)
 restores the reference activation branch and removes the benchmark's
-separate-input allocation bias; its complete matrix and repeat are required
-before claiming full parity.
+separate-input allocation bias. Its complete matrix and repeat now pass,
+with worst ratios 1.004591 / 1.006576; the
+[final validation table](MULTI_GPU_VALIDATION.md#final-mega-moe-matrix)
+identifies the exact source/compiler and each shape's measurements.
 The other three kernels' compiler-regression matrices also pass both rounds.
 These results require the patched compiler and do not establish parity for
 the unpatched dependency.
@@ -401,13 +403,13 @@ peers through the by-value `symm_rank_offsets[p]` array over one
 
 ### Where the ports differ from the origins
 
-The differences below mean these implementations are not yet faithful-port
-performance evidence. The TIRx POC requires the baseline's instructions and
-schedule, not speedups from different work partitioning or synchronization.
-Preserve these historical diagnostics, but restore/audit the baseline path
-before claiming IR parity. In particular, removing timeout paths for checker
-convenience is not an acceptable final port, and the flattened combine split
-must not substitute for fixing overhead in DeepGEMM's original loop.
+The list below describes earlier cross-implementation experiments and
+explicitly strengthened checker variants, not the current faithful benchmark.
+Current Mega MoE `ordering="origin"` retains the reference timeout, volatile
+loads, and serial combine loop; `benchmarks.peer.fidelity` retains CUTLASS's
+per-shard launch schedule. The final parity evidence uses those paths only.
+Different work partitioning, synchronization, or timeout removal cannot
+substitute for fixing IR-lowering overhead.
 
 Mega MoE:
 - **NVLink barrier:** DeepGEMM polls with `ld.acquire.sys` and traps after a
@@ -609,8 +611,10 @@ Keep raw measurement JSON outside Git. The legacy fused/chunked comparison
 and historical results below are cross-implementation experiments, not proof
 of faithful-port parity.
 
-All runs: 4x GB200 (sm_100a, 152 SMs), world size 4, torch 2.14.1+cu130,
-nvidia-cutlass-dsl 4.7.0.
+The legacy cross-implementation results use 4x GB200 (sm_100a, 152 SMs),
+world size 4, torch 2.14.1+cu130, and nvidia-cutlass-dsl 4.7.0. Hardware and
+toolchain details for the final faithful-port runs are recorded separately in
+the [validation audit](MULTI_GPU_VALIDATION.md#final-mega-moe-matrix).
 
 **Mega MoE** (`benchmarks/peer/mega_moe.py`):
 - **Timer:** DeepGEMM's own `deep_gemm.testing.bench_kineto` (DeepGEMM
@@ -706,17 +710,19 @@ A ratio is TIRx's latency over the origin's, so the bar is a ratio of at most
 
 ### Mega MoE
 
-The preceding faithful screen checks all 14 shapes for exact output and
-cumulative-statistics equality. The fresh NVRTC matrix misses the bar for
-`dsv3_t1` at 1.011856; an isolated 31-round run is 1.007077, while the
-`port_t2_h1024_e8_k1` cooldown run is 1.048116. The older table below is
-historical cross-implementation evidence, not validation of a clean current
-baseline-faithful port. Source `85c799e75ba5fd87` restores the activation
-specialization; the current benchmark uses shared input/weight/workspace
-storage, eliminating the allocation assignment difference documented in the
-[lowering audit](lowering/README.md#current-source-and-benchmark-correction).
-Its complete matrix and independent repeat remain separate requirements.
-The commands above regenerate raw JSONL outputs locally
+Source `85c799e75ba5fd87` and the final compiler patch pass all 14 shapes and
+the independent repeat, with worst ratios **1.004591 / 1.006576**. Every rank's
+BF16 output bits also match with statistics both enabled and disabled. The
+[current latency table](MULTI_GPU_VALIDATION.md#final-mega-moe-matrix) records
+each shape and the compiler-artifact audit that preserves the other ports'
+earlier passing results. Input/weight/workspace allocations are shared between
+implementations; output/statistics storage remains independent, and the
+timing protocol and 99% threshold are unchanged.
+
+Earlier separate-allocation misses (including 1.011856 and 1.048116) remain
+documented in the [lowering audit](lowering/README.md#previous-source-revalidation).
+The older table below is historical cross-implementation evidence, not the
+current baseline-faithful gate. The commands above regenerate raw JSONL outputs locally
 when a worker is available.
 
 | Shape | Tokens per rank | Hidden, I | Experts, top-k, shared | DeepGEMM (us) | TIRx (us) | Ratio | Repeat ratio |

@@ -23,7 +23,7 @@ The current audit found:
 | Two-shot all-reduce | Preserves the baseline's data layout, constexpr loop/rank, and terminal release/relaxed-CAS protocol. All 18 shapes and the independent repeat now pass bitwise equality, independent-reference precision, flag reset, and the unchanged 99% performance gate. |
 | GEMM + all-reduce | Restored baseline waits, elected leaders, and barrier sequence; removed the added exit GPU fence. All 19 shapes, both origins, three matched configurations, and the independent repeat now meet the unchanged precision/performance gate. `sys_fenced` remains a separate semantic example. |
 | All-gather GEMM | `benchmarks.peer.fidelity` restores CUTLASS's per-shard launches, exact auxiliary kernels, and common host schedule. Both 17-shape GPU rounds pass bitwise/reference correctness and the 99% gate at baseline-selected configurations; worst ratios are 1.001948 / 1.002322. The earlier fused/chunked and NumSim copy-warp variants are separate examples, not fidelity evidence. |
-| Mega MoE | Preserves reference timeout, loads, work partition, and synchronization, including mask-guarded combine-load warp barriers. `sys_fenced` stays separate. Generic CUDA loop/coordinate/register lowering and a read-only by-value parameter array restore reference peer-offset access without a port-only shared cache. Source `85c799e75ba5fd87` also restores the reference's compile-time activation branches. The benchmark now shares the actual input/weight/workspace allocations after an allocation-order diagnostic reversed the one-token timing gap. The complete matrix and independent repeat remain required; full parity is not yet established. The [compiler patch, source, tests, and evidence](lowering/README.md) are explicit prerequisites, not evidence for an unpatched compiler. |
+| Mega MoE | Preserves reference timeout, loads, work partition, synchronization, and compile-time activation branches. `sys_fenced` stays separate. Source `85c799e75ba5fd87`, with the final generic compiler patch and shared benchmark inputs, passes all 14 shapes and the independent repeat: worst ratios 1.004591 / 1.006576. Both statistics specializations match every BF16 output bit on all four ranks. The [compiler patch, source, tests, and evidence](lowering/README.md) are explicit prerequisites, not evidence for an unpatched compiler. |
 
 Actual CUTLASS and FlashInfer PTX/CUBIN and TIRx CUBIN were captured with the
 existing compiler under the socket lease. The CUTLASS artifact confirms elected
@@ -53,6 +53,66 @@ compile target preservation, rendezvous handling, and activation fidelity.
 The current source is `85c799e75ba5fd87`; older source stamps and
 separate-allocation results below remain historical evidence, not the current
 shared-input gate. No kernel schedule or benchmark timing threshold changes.
+
+### Final Mega MoE matrix
+
+The final source is `85c799e75ba5fd87`; the compiler patch SHA-256 is
+`09e2422bb37e0260155c8d35b48b50c2d479fcdd5506cf5d7580e29c8efb95f8`.
+Validation uses four socket-leased B300 GPUs, 148 SMs per GPU, driver
+580.126.09, and CUDA/NVRTC 13.2.78. The implementation uses the same reference
+instruction forms, not architecture-specific additions. All shapes retain
+`fast_math=1`, activation clamp 10, and the reference's launch configuration.
+
+Every row meets `TIRx/reference <= 1/0.99`. Each comparison uses 11 alternating
+paired rounds and the unchanged cold-cache protocol. Outputs and cumulative
+statistics match exactly before timing. A separate final-compiler run checks
+every BF16 output bit on all four ranks with statistics both enabled and
+disabled, for all 14 shapes.
+
+| Shape | First TIRx / reference (us) | First ratio | Repeat TIRx / reference (us) | Repeat ratio |
+|---|---:|---:|---:|---:|
+| `deepgemm_default` | 2771.000 / 2781.000 | 0.996404 | 2771.000 / 2781.000 | 0.996404 |
+| `port_t2_h1024_e8_k1` | 38.281 / 38.465 | 0.995216 | 37.662 / 37.872 | 0.994455 |
+| `port_t64_e384_k6` | 555.657 / 555.422 | 1.000423 | 554.907 / 554.728 | 1.000323 |
+| `port_t256_e384_k6` | 574.815 / 574.664 | 1.000263 | 574.814 / 574.535 | 1.000486 |
+| `port_t1024_e384_k6` | 643.833 / 643.728 | 1.000163 | 643.851 / 643.578 | 1.000424 |
+| `port_t8192_e384_k6` | 2433.000 / 2437.000 | 0.998359 | 2435.000 / 2439.000 | 0.998360 |
+| `dsv3_t1` | 99.632 / 99.284 | 1.003505 | 99.804 / 99.152 | 1.006576 |
+| `dsv3_t16` | 258.397 / 257.646 | 1.002915 | 258.338 / 257.466 | 1.003387 |
+| `dsv3_t64` | 293.154 / 292.207 | 1.003241 | 292.668 / 292.292 | 1.001286 |
+| `dsv3_t256` | 307.837 / 307.552 | 1.000927 | 307.797 / 307.618 | 1.000582 |
+| `dsv3_t1024` | 440.524 / 440.020 | 1.001145 | 441.582 / 441.253 | 1.000746 |
+| `dsv3_t2048` | 724.429 / 724.211 | 1.000301 | 723.768 / 723.679 | 1.000123 |
+| `dsv3_t4096` | 1450.000 / 1447.000 | 1.002073 | 1449.000 / 1447.000 | 1.001382 |
+| `dsv3_t8192` | 2626.000 / 2614.000 | 1.004591 | 2623.000 / 2613.000 | 1.003827 |
+
+The original shared-input matrix and repeat pass all 28 rows. Removing an
+unnecessary literal-bound unroll hint changes only the tiny shape's two cubins;
+that shape is remeasured above with the rebuilt final compiler. The remaining
+26 cubins are byte-identical to the measured images. The first one-token row
+had elevated CPU pressure despite 93% instantaneous idle; its retained ratio
+is 1.004376. The table uses the additional idle-preflight run (1.003505), not
+that row. The repeat, other matrix rows, and final tiny runs have low pressure.
+No failed timing is dropped or threshold widened.
+
+The final dependency audit checks all **802** functions from the other three
+ports: CUDA source, host LLVM IR, and serialized device/launch metadata match
+their previously validated compiler byte-for-byte. A separate audit rechecks
+every retained shape/origin/configuration in those first/repeat records:
+18 two-shot, 136 all-gather, and 114 GEMM/all-reduce rows per round, all correct
+and within 99%. This preserves the earlier evidence rather than inferring
+performance from a similar-looking kernel.
+
+With the final compiler, **980 feature tests pass** and the two changed CUDA
+codegen/PTX test files pass **352 tests with 37 skips** under the socket lease.
+The new polling-loop regression fails before the lowering fix and passes
+afterward. The prior 94 multimem and five partial-CTA live cases remain
+separate, no-skip evidence. All **734** tracked production/test files in the
+remote validation checkout match this worktree. Raw timing and trace artifacts
+remain outside Git. The broader-package failures documented below are not
+reported as a green full-suite result.
+
+### Earlier validation stages
 
 The faithful two-shot all-reduce passes **18 shapes per round**, twice, on
 four socket-leased GPUs with the existing CUDA 13.2.78 toolchain. Worst latency
@@ -225,7 +285,7 @@ sites, without strengthening the release scope or changing work/scheduling.
 Source `979bd32f26952708` passes 82 focused checks and two one-token GPU
 comparisons at 1.0000308 / 1.0032366, with exact output/statistics. The tiny
 case passes first at 0.9891977 but misses its repeat at **1.0256084**
-(33.001/32.177 microseconds). Full parity remains open. The
+(33.001/32.177 microseconds). That stage did not establish full parity. The
 [lowering evidence](lowering/README.md#restoring-reference-shared-address-forms)
 records the exact reference, disassembly delta, and all four comparisons.
 
@@ -320,9 +380,9 @@ execution-dependent checks still need the supported Linux environment.
 
 The separately strengthened `sys_fenced` GPU implementation is numerically bitwise-correct
 on the exercised probe shapes, but has **not** passed the 99% performance bar.
-Synchronization and pipeline optimizations remain in progress. The complete
-19-shape matrix and independent repeat are not yet validated for the final
-implementation. Its slowdown is not a measurement of like-for-like IR overhead.
+That exploratory optimization work is not part of the faithful-port POC.
+Its complete 19-shape matrix and independent repeat did not establish the
+final gate. Its slowdown is not a measurement of like-for-like IR overhead.
 For the port-fidelity gate, preserve the original comparison kernels and the
 99% threshold; neither historical data nor a differently optimized prototype
 closes it. Every accepted timing must use only the GPUs actually assigned by
@@ -339,8 +399,8 @@ the run used Python 3.13.15 and NVRTC 13.4.92 under the shared socket lease.
 This expands numerical evidence, **not** the performance claim: its triage
 timings used 20 graph launches, 3 interleaved trials, a 10 ms target, and 0.1 s
 idle, rather than the final comparison's 100 launches, 9 trials, and top-three
-configuration selection. The full performance gate and independent repeat
-remain open. A separately screened optimization prototype also matched the
+configuration selection. At that stage the full performance gate and independent
+repeat remained open. A separately screened optimization prototype also matched the
 outputs, but its scoped alias fences are not yet modeled by NumSim; it is
 neither the committed implementation nor checker-validated evidence.
 
@@ -382,7 +442,7 @@ The previous session reported 245 peer tests, 348 multimem tests including
 GPU microtests, 885 engine tests, and 15 frontend tests passing. These counts
 are historical reports; they have not been reproduced on this branch.
 
-## Correctness limits to resolve
+## Scope and limitations
 
 - **Full-scale GEMM + all-reduce now has faithful-port validation.** The default
   is now `ordering="origin"`; preserve the source's operations instead of
@@ -414,7 +474,7 @@ are historical reports; they have not been reproduced on this branch.
   GEMM tests complement the small model and their CPU matrix passes, but that
   result does not replace the final GPU validation or the other corpus gates.
 
-## Resume gates
+## Reproduction and acceptance gates
 
 1. Restore the compatible harness environment on a four-GPU Linux host, initialize
    the pinned `thirdparty/tvm-rust-ext` submodule, and install this branch.

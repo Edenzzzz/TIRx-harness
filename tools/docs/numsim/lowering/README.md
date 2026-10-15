@@ -32,29 +32,23 @@ The loop emitter adds this fallback after processing explicit unroll hints:
 }
 ```
 
-The corresponding while lowering is in the same class. A literal upper
-comparison bound of at most eight receives an unroll-factor hint of eight;
-this is not a proof of the loop's trip count. A scalar-parameter bound receives
-an uncounted hint; other dynamic conditions retain the no-unroll hint:
+The corresponding while lowering is in the same class. A literal comparison
+bound does not prove a trip count: polling for a small flag value can require
+arbitrarily many iterations. Such loops retain the no-unroll hint. A
+scalar-parameter bound receives the reference's uncounted hint:
 
 ```cpp
 void CodeGenCUDA::Dispatch_(const WhileNode* op) {
   PrintIndent();
-  bool small_static_bound = false;
   bool scalar_parameter_bound = false;
   if (const auto* less = op->condition.as<LTNode>()) {
-    PrimExpr simplified = sym::Analyzer()->Simplify(less->b);
-    const auto* immediate = simplified.as<IntImmNode>();
-    small_static_bound = immediate && immediate->value >= 0 && immediate->value <= 8;
     PrimExpr bound_expr = less->b;
     if (const auto* cast = bound_expr.as<CastNode>()) bound_expr = cast->value;
     if (const auto* variable = bound_expr.as<VarNode>()) {
       scalar_parameter_bound = scalar_parameter_vars_.count(variable) != 0;
     }
   }
-  stream << (small_static_bound ? "#pragma unroll 8\n"
-                                : (scalar_parameter_bound ? "#pragma unroll\n"
-                                                            : "#pragma unroll 1\n"));
+  stream << (scalar_parameter_bound ? "#pragma unroll\n" : "#pragma unroll 1\n");
   PrintIndent();
   stream << "while (1) {\n";
   int while_scope = BeginScope();
@@ -288,8 +282,8 @@ A subsequent revalidation with the final runtime records a new one-token miss:
 **98.793/97.277 microseconds (1.0155844x)**, with exact output/statistics.
 The final 28 CUDA images are byte-identical to the passing build, so static
 instruction count alone does not explain this discrepancy. This new miss is
-retained, and full parity remains open while the complete final-runtime matrix
-and independent repeat run.
+retained; full parity remained open at that stage. The later allocation
+crossover and final shared-input matrix below resolve that validation gap.
 
 A separate 802-function audit of the other three kernels compares generated
 CUDA, host LLVM IR, and serialized device/launch metadata between their
@@ -332,7 +326,7 @@ The preceding source stamp `979bd32f26952708` was rebuilt into a fresh cache and
 run across all 14 declared shapes with the patched generic compiler. Every
 output and cumulative statistic matched bitwise. The ratios were:
 
-The compiler patch now allows bounded literal `while` conditions with an upper
+The preceding prototype allowed literal `while` conditions with an upper
 bound of at most eight to use `#pragma unroll 8`; unbounded and runtime-bound
 loops retain `#pragma unroll 1`. A loop whose upper bound is a scalar kernel
 parameter uses CUDA's uncounted `#pragma unroll`, matching the origin's token
@@ -404,7 +398,10 @@ cumulative statistics remain independent. Input restoration, the 8 GB cache
 flush, GPU sleep, stream barrier, alternating order, timing aggregation, and
 `1 / 0.99` threshold are unchanged. Rows record `input_storage="shared"`, and
 the current gate rejects rows without that contract. The full 14-shape matrix
-and independent repeat remain required before claiming parity.
+and independent repeat now pass, with worst ratios **1.004591 / 1.006576**.
+The [final latency table and validation scope](../MULTI_GPU_VALIDATION.md#final-mega-moe-matrix)
+record each shape, the rebuilt compiler, and separate bit-level checks of both
+statistics specializations.
 
 Four activation-specialization controls fail on the old port. The shared-input
 construction control, two metadata controls, and target-context control also
@@ -412,6 +409,36 @@ fail before their respective fixes. The corrected port passes 86 focused
 peer numerical/race/sync/fidelity checks; the benchmark, rendezvous, and
 specialization regression run passes 43 tests. Test commands and complete
 matrix results belong to the validation record, not an inference from SASS.
+
+The final cross-port audit catches one unnecessary compiler expansion: the
+literal-bound hint treats a flag target as a trip count. In all-gather's
+`while seen < 3` polling helper it increases SASS from **72 to 96 instructions**
+and static global loads from **7 to 14**. The rule is removed, restoring
+`#pragma unroll 1` for such polls. The replacement regression,
+`test_small_flag_value_does_not_unroll_an_unbounded_poll`, fails on the earlier
+compiler. No kernel or synchronization protocol is changed.
+
+After rebuilding, all 802 other-port CUDA/LLVM/metadata artifacts match their
+validated compiler exactly. All 28 Mega MoE cubins match the no-hint prototype;
+26 also match the full matrix's original images. The remaining tiny-shape
+specializations are revalidated with the actual final compiler: **0.995216 /
+0.994455**, with exact output/statistics. Final feature validation passes
+**980 tests**; CUDA codegen/PTX validation passes **352 with 37 skips**. Both
+statistics modes match all BF16 bits on every rank of every Mega MoE shape.
+
+From the harness repository root, the focused commands are:
+
+```bash
+python -m pytest -q -n 4 --dist=worksteal \
+  tools/tests/numsim/registry/test_mega_moe_fidelity.py \
+  tools/tests/numsim/runtime/test_peer.py \
+  tools/tests/analysis_tools/racecheck/test_native_peer_kernels.py \
+  tools/tests/analysis_tools/synccheck/test_native_peer_kernels.py
+python -m pytest -q -n 4 --dist=worksteal \
+  tools/tests/test_mega_moe_fidelity.py \
+  tools/tests/test_mega_moe_rendezvous.py \
+  tools/tests/numsim/registry/test_mega_moe_fidelity.py
+```
 
 ### Timeline evidence
 
@@ -480,7 +507,15 @@ The focused command is:
 
 ```bash
 python -m pytest -q -n 2 tests/python/tirx/codegen/test_codegen_cuda.py \
-  -k 'serial_dynamic_loop_preserves_explicit_unroll_policy or serial_loop_with_dynamic_inner_loop or small_static_serial_loop or serial_pragma_unroll or serial_disable_unroll or native_execution_coordinates'
+  -k 'serial_dynamic_loop_preserves_explicit_unroll_policy or serial_loop_with_dynamic_inner_loop or small_static_serial_loop or serial_pragma_unroll or serial_disable_unroll or native_execution_coordinates or small_flag_value or scalar_parameter_while'
+```
+
+The final compiler run uses the node's GPU lease and both changed test files:
+
+```bash
+python -m pytest -q -n 4 --dist=worksteal \
+  tests/python/tirx/codegen/test_codegen_cuda.py \
+  tests/python/tirx/codegen/test_ptx_dialect.py
 ```
 
 ## Reproduction
@@ -504,6 +539,10 @@ Use `tools/benchmarks/peer/mega_moe.py` to prepare and compare `dsv3_t1` against
 the pinned DeepGEMM reference. Keep separate preparation caches for the original
 and patched compiler: the benchmark's source stamp does not include compiler
 binary identity. Acquire the node's shared GPU lease before running comparisons.
+
+For preparation with no visible GPU, set `TIRX_PREPARE_CUDA_ARCH` to the intended
+runtime target and pass `--num-sms` with that device's SM count. Both must match
+the device used for comparison; preparation must not guess another target.
 
 ```bash
 PYTHONPATH=tools python -m benchmarks.peer.mega_moe prepare \

@@ -1,5 +1,5 @@
 diff --git a/src/backend/cuda/codegen/codegen_cuda.cc b/src/backend/cuda/codegen/codegen_cuda.cc
-index e7a06977c..8465c2afa 100644
+index e7a06977c..1218e6e0c 100644
 --- a/src/backend/cuda/codegen/codegen_cuda.cc
 +++ b/src/backend/cuda/codegen/codegen_cuda.cc
 @@ -181,6 +181,10 @@ void CodeGenCUDA::Init(bool output_ssa) {
@@ -84,31 +84,25 @@ index e7a06977c..8465c2afa 100644
    }
    PrintIndent();
    std::string vid = AllocVarID(op->loop_var.get());
-@@ -382,8 +420,21 @@ void CodeGenCUDA::Dispatch_(const tirx::ForNode* op) {
+@@ -382,8 +420,15 @@ void CodeGenCUDA::Dispatch_(const tirx::ForNode* op) {
  
  void CodeGenCUDA::Dispatch_(const WhileNode* op) {
    PrintIndent();
 -  // Match CodeGenC: dynamic-trip-count loops must not be unrolled.
 -  stream << "#pragma unroll 1\n";
-+  bool small_static_bound = false;
 +  bool scalar_parameter_bound = false;
 +  if (const auto* less = op->condition.as<LTNode>()) {
-+    PrimExpr simplified = sym::Analyzer()->Simplify(less->b);
-+    const auto* immediate = simplified.as<IntImmNode>();
-+    small_static_bound = immediate && immediate->value >= 0 && immediate->value <= 8;
 +    PrimExpr bound_expr = less->b;
 +    if (const auto* cast = bound_expr.as<CastNode>()) bound_expr = cast->value;
 +    if (const auto* variable = bound_expr.as<VarNode>()) {
 +      scalar_parameter_bound = scalar_parameter_vars_.count(variable) != 0;
 +    }
 +  }
-+  stream << (small_static_bound ? "#pragma unroll 8\n"
-+                                : (scalar_parameter_bound ? "#pragma unroll\n"
-+                                                            : "#pragma unroll 1\n"));
++  stream << (scalar_parameter_bound ? "#pragma unroll\n" : "#pragma unroll 1\n");
    PrintIndent();
    stream << "while (1) {\n";
    int while_scope = BeginScope();
-@@ -399,6 +450,8 @@ void CodeGenCUDA::Dispatch_(const WhileNode* op) {
+@@ -399,6 +444,8 @@ void CodeGenCUDA::Dispatch_(const WhileNode* op) {
  void CodeGenCUDA::BindThreadIndex(const IterVar& iv) {
    TVM_FFI_ICHECK(!var_idmap_.count(iv->var.get()));
    const auto& scope = runtime::ThreadScope::Create(iv->thread_tag);
@@ -117,7 +111,7 @@ index e7a06977c..8465c2afa 100644
    if (scope.IsClusterCtaIdx()) {
      TVM_FFI_ICHECK_GE(scope.dim_index, 0);
      TVM_FFI_ICHECK_LT(scope.dim_index, 3);
-@@ -415,10 +468,36 @@ void CodeGenCUDA::BindThreadIndex(const IterVar& iv) {
+@@ -415,10 +462,36 @@ void CodeGenCUDA::BindThreadIndex(const IterVar& iv) {
                                     ";\" : \"=r\"(ctaid) :);\n"
                                     "  return ctaid;\n"
                                     "}\n");
@@ -539,7 +533,7 @@ index 01fd9b39a..c90deaf93 100644
    }
  
 diff --git a/tests/python/tirx/codegen/test_codegen_cuda.py b/tests/python/tirx/codegen/test_codegen_cuda.py
-index 04e872c83..98912df7d 100644
+index 04e872c83..1f6cfab68 100644
 --- a/tests/python/tirx/codegen/test_codegen_cuda.py
 +++ b/tests/python/tirx/codegen/test_codegen_cuda.py
 @@ -364,9 +364,7 @@ def test_tirx_cuda_kernel_return_zero_codegen_is_void_early_return():
@@ -553,7 +547,7 @@ index 04e872c83..98912df7d 100644
      assert "return;" in src
      assert "return 0;" not in src
  
-@@ -416,6 +414,265 @@ def test_serial_disable_unroll_pragma_immediately_precedes_dynamic_for():
+@@ -416,6 +414,268 @@ def test_serial_disable_unroll_pragma_immediately_precedes_dynamic_for():
      assert re.search(r"#pragma unroll 1\s*for \(", src)
  
  
@@ -585,16 +579,19 @@ index 04e872c83..98912df7d 100644
 +    assert re.search(r"#pragma unroll 1\s*for \(", src)
 +
 +
-+def test_small_static_while_uses_bounded_unroll():
++def test_small_flag_value_does_not_unroll_an_unbounded_poll():
 +    @T.prim_func
-+    def main(A: T.Buffer((32,), "int32")):
++    def main(flag: T.Buffer((1,), "uint32"), output: T.Buffer((1,), "uint32")):
 +        T.device_entry()
-+        tx = T.thread_id([32])
-+        while A[tx] < 4:
-+            A[tx] = A[tx] + 1
++        T.thread_id([1])
++        seen = T.alloc_local((1,), "uint32")
++        seen[0] = T.uint32(0)
++        while seen[0] < T.uint32(3):
++            T.ptx.ld.relaxed.sys.global_.b32(seen[0], T.address_of(flag[0]))
++        output[0] = seen[0]
 +
 +    src, _ = _get_source(main)
-+    assert re.search(r"#pragma unroll 8\s*while \(1\)", src)
++    assert re.search(r"#pragma unroll 1\s*while \(1\)", src)
 +
 +
 +def test_scalar_parameter_while_uses_compiler_unroll_choice():
@@ -819,7 +816,7 @@ index 04e872c83..98912df7d 100644
  def test_cluster_cta_id_codegen_uses_coordinate_sregs():
      @T.prim_func
      def main(A: T.Buffer((1,), "int32")):
-@@ -432,6 +689,107 @@ def test_cluster_cta_id_codegen_uses_coordinate_sregs():
+@@ -432,6 +692,107 @@ def test_cluster_cta_id_codegen_uses_coordinate_sregs():
      assert "cooperative_groups::cluster_group::block_index" not in src
  
  
