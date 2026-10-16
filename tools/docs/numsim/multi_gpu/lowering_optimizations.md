@@ -131,12 +131,29 @@ coordinate caching and later simplifications are measured separately below.
 
 ## 2. Repeated execution-coordinate reads
 
-**Issue.** The original coordinate binding expands every use to the builtin:
+**Issue.** The IR has one logical coordinate variable, such as `lane`, but the
+original binding did not materialize that value. It mapped the variable directly
+to the CUDA builtin expression:
 
 ```cpp
 var_idmap_[iv->var.get()] =
     CastFromTo(iv->thread_tag, PrimType::UInt(32), iv->var.ty());
 ```
+
+Therefore a use such as `out[lane] = src[lane] + lane` became the equivalent
+of this generated CUDA, with the builtin repeated at every use:
+
+```cuda
+out[(uint32_t)threadIdx.x] =
+    src[(uint32_t)threadIdx.x] + (uint32_t)threadIdx.x;
+```
+
+`threadIdx.x`, `blockIdx.x`, and cluster coordinates are native special-register
+queries, not ordinary immutable C variables. Repeating them prevents the
+lowering from guaranteeing one read and gives ptxas more copies to materialize
+or keep live. In the port's coordinate-heavy copy/TMA/MMA paths, that increases
+instruction and register pressure; it is not a change to launch geometry or
+thread semantics.
 
 **Triggering form.** The all-gather port binds several execution coordinates
 once in `tools/ported/cutlass/sm100_all_gather_gemm.py:473-485`, then reuses them
@@ -152,14 +169,17 @@ warp = txl.warp_id()
 lane = txl.lane_id()
 ```
 
-**Fix.** The patched binding emits one local value from the same native special-register
-read and retains its launch-derived range. For example, the 512-thread launch
-emits:
+**Fix.** The patched binding emits one local value from the same native
+special-register read and rewrites all later uses to that local. For example,
+the 512-thread launch emits:
 
 ```cuda
 uint32_t __tirx_cached_tid_x;
 asm volatile("mov.u32 %0, %%tid.x;" : "=r"(__tirx_cached_tid_x));
 __builtin_assume(__tirx_cached_tid_x < 512);
+
+out[__tirx_cached_tid_x] =
+    src[__tirx_cached_tid_x] + __tirx_cached_tid_x;
 ```
 
 Bounds come from the corresponding static `thread_extent`, including partial
